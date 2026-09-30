@@ -12,7 +12,7 @@
 use std::fs::{self, DirBuilder};
 use std::io::Write;
 use std::os::unix::fs::DirBuilderExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use snp::codec::hex;
@@ -25,6 +25,11 @@ pub struct Target {
     pub port: u16,
     pub jump: Option<String>,
     pub identity: Option<PathBuf>,
+    /// A certificate for `identity` from the server unlock key.
+    pub certificate: Option<PathBuf>,
+    /// A solo server: `identity` is the server unlock key, whose public half
+    /// this is, and a certificate is signed for each unlock (`solo_cert`).
+    pub solo: Option<PathBuf>,
 }
 
 /// The single known_hosts entry for host:port, as OpenSSH writes it with
@@ -47,6 +52,8 @@ fn key_for(known_hosts: &str, host: &str, port: u16) -> Result<(String, Vec<u8>)
 pub struct Session {
     dir: PathBuf,
     target: Target,
+    /// The certificate this session authenticates with, if any.
+    cert: Option<PathBuf>,
     /// The host key blob recorded from this connection.
     pub host_key: Vec<u8>,
     pub host_key_line: String,
@@ -79,6 +86,9 @@ impl Session {
         if let Some(id) = &t.identity {
             c.arg("-i").arg(id).args(["-o", "IdentitiesOnly=yes"]);
         }
+        if let Some(cert) = &self.cert {
+            c.arg("-o").arg(format!("CertificateFile={}", cert.display()));
+        }
         if let Some(j) = &t.jump {
             c.arg("-J").arg(j);
         }
@@ -95,7 +105,11 @@ impl Session {
         // Short: a ControlPath must fit in a Unix socket address.
         let dir = base.join(format!("vmtu-{}", random_hex(6)?));
         DirBuilder::new().mode(0o700).create(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let mut s = Session { dir, target, host_key: vec![], host_key_line: String::new() };
+        let cert = target.certificate.clone();
+        let mut s = Session { dir, target, cert, host_key: vec![], host_key_line: String::new() };
+        if let Some(unlock_key) = s.target.solo.clone() {
+            s.cert = Some(s.solo_cert(&unlock_key)?);
+        }
 
         // -f backgrounds the master once it has authenticated. The background
         // process keeps whatever stdout and stderr it was given, so they go to
@@ -117,6 +131,55 @@ impl Session {
         }
         (s.host_key_line, s.host_key) = s.recorded_key()?;
         Ok(s)
+    }
+
+    /// A solo server's certificate for this unlock. The owner's own key is
+    /// the server unlock key, so it signs itself, through the SSH agent: the
+    /// private half never leaves the agent, and nothing long-lived is made.
+    /// Valid from a minute ago (clock skew) for five minutes, for the one
+    /// principal stage 0 accepts, with no extensions; written in this
+    /// session's private folder, which goes when the session does.
+    fn solo_cert(&self, unlock_key: &Path) -> Result<PathBuf, String> {
+        let line = fs::read_to_string(unlock_key).map_err(|e| format!("{}: {e}", unlock_key.display()))?;
+        let blob = ed25519_blob_from_line(line.trim()).ok_or("the server unlock key is not ssh-ed25519")?;
+        let id = self.target.identity.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+        let listed = Command::new("ssh-add").arg("-L").stderr(Stdio::null()).output();
+        let held = listed
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .any(|l| ed25519_blob_from_line(l) == Some(blob.clone()))
+            })
+            .unwrap_or(false);
+        if !held {
+            return Err(format!(
+                "your SSH agent does not hold your key {id}, which signs this unlock (a solo server).\n\
+                 Add it, then run vmt-unlock again: on a Mac, ssh-add --apple-use-keychain {id}\n\
+                 (elsewhere, ssh-add {id})"
+            ));
+        }
+        let pubf = self.dir.join("solo.pub");
+        fs::write(&pubf, format!("{}\n", line.trim())).map_err(|e| format!("{}: {e}", pubf.display()))?;
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let out = Command::new("ssh-keygen")
+            .args(["-q", "-U", "-s"])
+            .arg(&pubf)
+            .args(["-I", &format!("vmt-unlock solo {secs}"), "-n", "unlock", "-O", "clear", "-V", "-1m:+5m"])
+            .arg(&pubf)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("ssh-keygen: {e}"))?;
+        let cert = self.dir.join("solo-cert.pub");
+        if !out.status.success() || !cert.is_file() {
+            return Err(format!(
+                "could not sign this unlock's certificate through your SSH agent: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(cert)
     }
 
     /// The one known_hosts entry for this destination, written by the master.

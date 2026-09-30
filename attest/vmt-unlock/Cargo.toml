@@ -1,7 +1,9 @@
 [package]
 name = "vmt-unlock"
 description = "Verify a stage 0 guest's attestation report, then release its disk key"
-version.workspace = true
+# Its own version, not the workspace's: a version bump of the snp library or
+# the stage 0 agent would change the agent's binary, and so every measurement.
+version = "0.4.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

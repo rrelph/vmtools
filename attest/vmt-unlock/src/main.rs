@@ -2,6 +2,7 @@
 //! then, release its disk key (design/attested-unlock-design.md, sections 7
 //! and 8).
 
+mod config;
 mod explain;
 mod kds;
 mod ssh;
@@ -23,15 +24,27 @@ use snp::verify::{Expectations, verify};
 use ui::Ui;
 
 const USAGE: &str = "\
-usage: vmt-unlock [options] [user@]host
+usage: vmt-unlock [options] <server>
+       vmt-unlock [options] [user@]host
+
+  <server> is a folder of yours, ~/.config/vmt-unlock/<server>/, whose
+  `config` names the VM, your key, the server unlock key and the accepted
+  measurements (one per line; a rollover adds one). Options given here
+  override it. Without one, give host and every required option.
 
   --step              explain each stage and check, and wait for Enter
                       before each one (for your first unlock)
   -p, --port N        the unlock service's port (default 2222)
   -J, --jump DEST     reach it through DEST (ssh -J); nothing depends on DEST
-  -i, --identity FILE your member key; its certificate is FILE-cert.pub
-      --org-ca FILE   your organization's CA public key (required): the VM
-                      must have been started for exactly this CA
+  -i, --identity FILE your SSH key; its certificate is FILE-cert.pub unless
+                      --certificate says otherwise
+      --certificate FILE your certificate from the server unlock key. With
+                      none, when your key IS the server unlock key (a solo
+                      server), one valid for five minutes is signed for this
+                      unlock through your SSH agent
+      --unlock-key FILE the server unlock key, public half (required): the
+                      VM must have been started for exactly this key
+                      (--org-ca is the same option, by its old name)
       --measurement HEX an accepted launch measurement (required; repeat
                       for more than one)
       --min-tcb B:T:S:M minimum bootloader:tee:snp:microcode (required)
@@ -52,7 +65,8 @@ usage: vmt-unlock [options] [user@]host
   -V, --version       the version
 
 exit status: 0 unlocked; 1 a check failed, nothing sent; 2 usage;
-3 connection or protocol error, nothing sent; 4 the VM refused the passphrase
+3 connection or protocol error, nothing sent; 4 the VM did not unlock
+(it refused the passphrase, or could not start the unlocked system)
 ";
 
 /// Where the disk passphrase comes from. Read only after every check passes,
@@ -69,6 +83,8 @@ const PASSPHRASE_ENV: &str = "VMT_UNLOCK_PASSPHRASE";
 
 struct Opts {
     step: bool,
+    /// The <server> whose config was read, if any.
+    server: Option<String>,
     target: ssh::Target,
     key: KeySource,
     /// host_data the report must carry, from --org-ca.
@@ -130,10 +146,15 @@ fn parse_args(args: Vec<String>) -> Result<Opts, Fail> {
     let u = |m: &str| Fail::Usage(m.to_string());
     let mut it = args.into_iter();
     let (mut step, mut port, mut jump, mut identity, mut key_file, mut dest) =
-        (false, 2222u16, None, None, None, None);
-    let mut org_ca: Option<PathBuf> = None;
-    let (mut measurements, mut min_tcb, mut min_abi, mut smt_allowed, mut chip_ids) =
-        (vec![], None, (0, 0), true, vec![]);
+        (false, None, None, None, None, None);
+    let (mut unlock_key, mut certificate): (Option<PathBuf>, Option<PathBuf>) = (None, None);
+    let (mut measurements, mut min_tcb, mut min_abi, mut smt_allowed, mut chip_ids): (
+        Vec<String>,
+        _,
+        _,
+        _,
+        _,
+    ) = (vec![], None, (0, 0), true, vec![]);
     let (mut cache, mut proxy, mut offline, mut save) = (kds::default_cache(), None, false, None);
     #[cfg(feature = "fault-injection")]
     let mut inject_stale_nonce = false;
@@ -141,19 +162,14 @@ fn parse_args(args: Vec<String>) -> Result<Opts, Fail> {
         let mut val = || it.next().ok_or_else(|| Fail::Usage(format!("{a} needs a value")));
         match a.as_str() {
             "--step" => step = true,
-            "-p" | "--port" => port = val()?.parse().map_err(|_| u("bad --port"))?,
+            "-p" | "--port" => port = Some(val()?.parse().map_err(|_| u("bad --port"))?),
             "-J" | "--jump" => jump = Some(val()?),
             "-i" | "--identity" => identity = Some(PathBuf::from(val()?)),
+            "--certificate" => certificate = Some(PathBuf::from(val()?)),
             "--key-file" => key_file = Some(val()?),
-            "--org-ca" => org_ca = Some(PathBuf::from(val()?)),
-            "--measurement" => measurements.push(
-                unhex(&val()?)
-                    .and_then(|v| v.try_into().ok())
-                    .ok_or_else(|| u("--measurement: 96 hex digits"))?,
-            ),
-            "--min-tcb" => {
-                min_tcb = Some(Tcb::parse(&val()?).ok_or_else(|| u("--min-tcb: B:T:S:M, decimal"))?)
-            }
+            "--unlock-key" | "--org-ca" => unlock_key = Some(PathBuf::from(val()?)),
+            "--measurement" => measurements.push(val()?),
+            "--min-tcb" => min_tcb = Some(val()?),
             "--min-abi" => {
                 let v = val()?;
                 let (a, b) = v.split_once('.').ok_or_else(|| u("--min-abi: MAJOR.MINOR"))?;
@@ -180,24 +196,62 @@ fn parse_args(args: Vec<String>) -> Result<Opts, Fail> {
             _ => return Err(u("more than one destination")),
         }
     }
-    let dest = dest.ok_or_else(|| u("no destination given"))?;
-    let (user, host) = match dest.split_once('@') {
-        Some((u, h)) => (u.to_string(), h.to_string()),
-        None => ("root".to_string(), dest),
+    let dest = dest.ok_or_else(|| u("no server or destination given"))?;
+
+    // <server>: a config of the owner's, which options given here override.
+    // Measurements given here replace the config's rather than adding to them.
+    let server = match config::find(&dest) {
+        Some(f) => Some(config::load(&dest, &f).map_err(Fail::Usage)?),
+        None => None,
     };
-    if measurements.is_empty() {
-        return Err(u("at least one --measurement is required"));
+    let (mut user, host) = match (&server, dest.split_once('@')) {
+        (Some(s), _) => (s.user.clone(), s.host.clone()),
+        (None, Some((u, h))) => (Some(u.to_string()), h.to_string()),
+        (None, None) => (None, dest.clone()),
+    };
+    if let Some(s) = &server {
+        port = port.or(s.port);
+        jump = jump.or_else(|| s.jump.clone());
+        identity = identity.or_else(|| s.identity.clone());
+        unlock_key = unlock_key.or_else(|| s.unlock_key.clone());
+        certificate = certificate.or_else(|| s.certificate.clone());
+        min_tcb = min_tcb.or_else(|| s.min_tcb.clone());
+        if measurements.is_empty() {
+            measurements = s.measurements.clone();
+        }
     }
-    let org_ca = org_ca.ok_or_else(|| u("--org-ca is required: your organization's CA public key"))?;
-    let ca_text =
-        fs::read_to_string(&org_ca).map_err(|e| Fail::Usage(format!("{}: {e}", org_ca.display())))?;
-    let ca_lines: Vec<&str> = ca_text.lines().filter(|l| !l.trim().is_empty()).collect();
-    let [ca_line] = ca_lines[..] else {
-        return Err(Fail::Usage(format!("{}: expected exactly one public key line", org_ca.display())));
-    };
-    let ca_blob = ed25519_blob_from_line(ca_line)
-        .ok_or_else(|| Fail::Usage(format!("{}: not an ssh-ed25519 public key", org_ca.display())))?;
+    let user = user.take().unwrap_or_else(|| "root".to_string());
+    let where_ = server.as_ref().map(|s| format!(" (in {})", s.file.display())).unwrap_or_default();
+
+    let measurements = measurements
+        .iter()
+        .map(|m| {
+            unhex(m)
+                .and_then(|v| v.try_into().ok())
+                .ok_or_else(|| Fail::Usage(format!("measurement{where_}: expected 96 hex digits, got {m:?}")))
+        })
+        .collect::<Result<Vec<[u8; 48]>, Fail>>()?;
+    if measurements.is_empty() {
+        return Err(Fail::Usage(format!("at least one measurement is required{where_}")));
+    }
+    let min_tcb = min_tcb.ok_or_else(|| Fail::Usage(format!("--min-tcb is required{where_}")))?;
+    let min_tcb = Tcb::parse(&min_tcb).ok_or_else(|| u("min-tcb: B:T:S:M, decimal"))?;
+    let unlock_key = unlock_key
+        .ok_or_else(|| Fail::Usage(format!("the server unlock key is required (--unlock-key){where_}")))?;
+    let ca_blob = one_key(&unlock_key)?;
     let host_data = snp::binding::host_data_for_ca(&ca_blob);
+
+    // A solo server: the owner's own SSH key is the server unlock key, and no
+    // certificate is configured, so one is signed for this unlock through the
+    // agent (ssh.rs). Only when the key really is the unlock key: anyone else
+    // needs a certificate from whoever holds it.
+    let solo = match (&certificate, &identity) {
+        (None, Some(id)) => {
+            let pubf = PathBuf::from(format!("{}.pub", id.display()));
+            fs::metadata(&pubf).is_ok() && one_key(&pubf)? == ca_blob
+        }
+        _ => false,
+    };
     let key = match key_file.as_deref() {
         Some("-") => KeySource::Stdin,
         Some(f) => KeySource::File(PathBuf::from(f)),
@@ -206,11 +260,20 @@ fn parse_args(args: Vec<String>) -> Result<Opts, Fail> {
     };
     Ok(Opts {
         step,
-        target: ssh::Target { user, host, port, jump, identity },
+        server: server.map(|s| s.name),
+        target: ssh::Target {
+            user,
+            host,
+            port: port.unwrap_or(2222),
+            jump,
+            identity,
+            certificate,
+            solo: solo.then_some(unlock_key),
+        },
         key,
         host_data,
         measurements,
-        min_tcb: min_tcb.ok_or_else(|| u("--min-tcb is required"))?,
+        min_tcb,
         min_abi,
         smt_allowed,
         chip_ids,
@@ -219,6 +282,17 @@ fn parse_args(args: Vec<String>) -> Result<Opts, Fail> {
         #[cfg(feature = "fault-injection")]
         inject_stale_nonce,
     })
+}
+
+/// The one ssh-ed25519 public key in a file, as its wire blob.
+fn one_key(f: &std::path::Path) -> Result<Vec<u8>, Fail> {
+    let text = fs::read_to_string(f).map_err(|e| Fail::Usage(format!("{}: {e}", f.display())))?;
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let [line] = lines[..] else {
+        return Err(Fail::Usage(format!("{}: expected exactly one public key line", f.display())));
+    };
+    ed25519_blob_from_line(line)
+        .ok_or_else(|| Fail::Usage(format!("{}: not an ssh-ed25519 public key", f.display())))
 }
 
 fn nonce() -> Result<Vec<u8>, Fail> {
@@ -290,6 +364,12 @@ fn run(o: Opts) -> Result<(), Fail> {
 
     let t = &o.target;
     ui.stage("connecting to your VM", explain::CONNECT);
+    if let Some(name) = &o.server {
+        ui.say(&format!("server {name}"));
+    }
+    if t.solo.is_some() {
+        ui.say("a solo server: signing this unlock's certificate with your key, through your SSH agent");
+    }
     let via = t.jump.as_ref().map(|j| format!(" via {j}")).unwrap_or_default();
     ui.say(&format!("connecting to {}@{}:{}{via}", t.user, t.host, t.port));
     let tc = Instant::now();
@@ -362,9 +442,7 @@ fn run(o: Opts) -> Result<(), Fail> {
     let verdict = verify(&r, &vcek, &chain, &exp);
     let ms_verify = tc.elapsed().as_millis();
     ui.say("checks:");
-    for c in &verdict.checks {
-        ui.check(c);
-    }
+    ui.checks(&verdict.checks);
     let timing = |ui: &Ui, ms_unlock: &str| {
         ui.say(&format!(
             "timing: connect {ms_connect} ms, attest {ms_attest} ms, VCEK {ms_vcek} ms, verify {ms_verify} ms{ms_unlock}"

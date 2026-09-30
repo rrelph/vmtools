@@ -17,7 +17,7 @@ Owners install `vmt-unlock` and nothing else, from a release tag, with the
 versions of every library pinned by `Cargo.lock`:
 
 ```sh
-cargo install --locked --git https://github.com/rrelph/vmtools --tag vmt-unlock-0.3.0 vmt-unlock
+cargo install --locked --git https://github.com/rrelph/vmtools --tag vmt-unlock-0.4.0 vmt-unlock
 ```
 
 Naming `vmt-unlock` matters: the workspace has two binaries, and

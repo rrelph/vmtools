@@ -56,12 +56,22 @@ impl Ui {
         }
     }
 
+    /// The checks that ran, numbered and counted among themselves. A check
+    /// the owner has not set up (the chip_id allowlist, without --chip-id)
+    /// does not run, and is neither shown nor counted.
+    pub fn checks(&self, all: &[Check]) {
+        let ran: Vec<&Check> = all.iter().filter(|c| !matches!(c.outcome, Outcome::Skip(_))).collect();
+        for (i, c) in ran.iter().enumerate() {
+            self.check(i + 1, ran.len(), c);
+        }
+    }
+
     /// One check. Plain: its result and the values compared. --step: first
     /// what it is and why it matters, then a pause, then the same result.
-    pub fn check(&self, c: &Check) {
+    fn check(&self, i: usize, n: usize, c: &Check) {
         if self.step {
             println!();
-            println!("--- Check {} of 10: {} ({}) ---", c.number, explain::title(c.number), c.name);
+            println!("--- Check {i} of {n}: {} ({}) ---", explain::title(c.number), c.name);
             println!();
             println!("{}", explain::check(c.number));
             pause();
@@ -71,7 +81,7 @@ impl Ui {
             Outcome::Fail(w) => ("FAIL", format!(": {w}")),
             Outcome::Skip(w) => ("SKIP", format!(": {w}")),
         };
-        println!("  [{tag}] {:>2}. {}{why}", c.number, c.name);
+        println!("  [{tag}] {i:>2}. {}{why}", c.name);
         for line in c.detail.lines() {
             println!("          {line}");
         }
