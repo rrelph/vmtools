@@ -23,6 +23,20 @@ cargo install --locked --git https://github.com/rrelph/vmtools --tag vmt-unlock-
 Naming `vmt-unlock` matters: the workspace has two binaries, and
 `stage0-agent` is not for owners.
 
+### What a build of the workspace produces
+
+- **`vmt-unlock`**, the unlock tool: the one program an owner installs.
+- **`stage0-agent`**, stage 0's side of the unlock: built into stage 0's initrd
+  by `stage0/build.sh`. It runs as root inside a VM's first boot and has no
+  use on anyone's computer. `cargo install … vmt-unlock` does not build it.
+- **`libder_derive-*.so`** (`.dylib` on a Mac), in `target/*/deps/`: not a
+  program anyone runs, but a procedural macro, a compiled plugin that the
+  Rust compiler loads while building, to write the DER-decoding code the
+  X.509 certificate parser (`x509-cert`) uses. It is code from a dependency
+  that runs at build time, with the build scripts listed below.
+- Test binaries, with `cargo test`: `snp`, `fixtures`, `snpguest`, and the
+  two programs' own.
+
 ## Building and testing
 
 ```sh
