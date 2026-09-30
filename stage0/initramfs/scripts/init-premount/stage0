@@ -1,0 +1,81 @@
+#!/bin/sh
+# Stage 0, before the root device is looked for: a fresh host key in tmpfs,
+# networking, and sshd with the agent as its only command.
+
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "$1" in
+prereqs) prereqs; exit 0 ;;
+esac
+
+. /scripts/functions
+
+# The host controls both consoles: the virtual keyboard on tty0 and the serial
+# line on ttyS0. Nothing in stage 0 reads either, and this turns off the one
+# thing that would still act on a keypress, the kernel's SysRq handler (the
+# build's default lets the keyboard reboot, sync, or kill the console's
+# processes). First, before anything else runs.
+echo 0 > /proc/sys/kernel/sysrq || panic "stage0: cannot turn SysRq off"
+
+S=/run/stage0
+mkdir -m 0700 "$S" || panic "stage0: cannot create $S"
+
+# configfs-tsm is how the agent asks for a report.
+if ! grep -q ' /sys/kernel/config ' /proc/mounts; then
+	mount -t configfs configfs /sys/kernel/config || panic "stage0: cannot mount configfs"
+	: > "$S/mounted-configfs"
+fi
+[ -d /sys/kernel/config/tsm/report ] || panic "stage0: no configfs-tsm; not an SEV-SNP guest?"
+
+# The organization's CA public key comes from the host, in fw_cfg, and is
+# trusted only if it is the one the host committed to in host_data at launch,
+# which the processor reports and the host cannot change afterwards (design
+# section 6, step 3.3). On any mismatch, stop here: sshd never starts, and
+# panic=-1 ends the VM.
+CA_FWCFG=/sys/firmware/qemu_fw_cfg/by_name/opt/org.vmtrust/org-ca.pub/raw
+[ -r "$CA_FWCFG" ] || panic "stage0: no org CA in fw_cfg (opt/org.vmtrust/org-ca.pub); not starting sshd"
+dd if="$CA_FWCFG" of="$S/org-ca.pub" bs=4096 count=1 2>/dev/null || panic "stage0: cannot read the org CA from fw_cfg"
+/usr/sbin/stage0-agent --check-host-data "$S/org-ca.pub" \
+	|| panic "stage0: the org CA does not match this VM's host_data; not starting sshd"
+
+# DHCP on stage 0's own say-so, not an ip= on the command line: with ip= set,
+# init configures the network a second time after mounting root.
+IP=dhcp configure_networking
+
+# Never on disk, never in the image: made here, removed in init-bottom.
+ssh-keygen -q -t ed25519 -N '' -C stage0 -f "$S/host_ed25519" || panic "stage0: ssh-keygen failed"
+
+if [ ! -d /run/sshd ]; then
+	mkdir -m 0755 /run/sshd
+	: > "$S/made-run-sshd"
+fi
+
+cat > "$S/sshd_config" <<CONF
+Port 2222
+HostKey $S/host_ed25519
+PidFile none
+TrustedUserCAKeys $S/org-ca.pub
+AuthorizedPrincipalsFile /etc/stage0/principals
+AuthorizedKeysFile none
+AllowUsers root
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM no
+PermitTTY no
+PermitUserRC no
+PermitUserEnvironment no
+DisableForwarding yes
+PermitTunnel no
+LoginGraceTime 30
+MaxAuthTries 3
+ClientAliveInterval 15
+ClientAliveCountMax 4
+ForceCommand /usr/sbin/stage0-agent
+CONF
+
+/usr/sbin/sshd -D -e -f "$S/sshd_config" </dev/null >/dev/console 2>&1 &
+echo $! > "$S/sshd.pid"
+fp=$(ssh-keygen -lf "$S/host_ed25519.pub")
+log_success_msg "stage0: sshd on port 2222, host key $fp"

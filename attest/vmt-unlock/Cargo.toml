@@ -1,0 +1,18 @@
+[package]
+name = "vmt-unlock"
+description = "Verify a stage 0 guest's attestation report, then release its disk key"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Test builds only: lets the end-to-end tests perturb one input to a check
+# (see --inject in main.rs). Never enabled in a release build.
+fault-injection = []
+
+[dependencies]
+snp = { path = "../snp" }
+sha2.workspace = true
+libc.workspace = true

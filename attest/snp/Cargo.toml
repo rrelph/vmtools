@@ -1,0 +1,20 @@
+[package]
+name = "snp"
+description = "SEV-SNP attestation report parsing and the guest owner's checks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# The guest owner's side: certificate chain and signature checks. Stage 0's
+# agent builds without it and needs only sha2 (the binding, the parser).
+default = ["verify"]
+verify = ["dep:p384", "dep:rsa", "dep:x509-cert"]
+
+[dependencies]
+sha2.workspace = true
+p384 = { workspace = true, optional = true }
+rsa = { workspace = true, optional = true }
+x509-cert = { workspace = true, optional = true }

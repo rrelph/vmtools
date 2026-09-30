@@ -1,0 +1,9 @@
+# Loaded at boot by initramfs-tools, in this order. Everything else stage 0
+# needs (virtio, ext4, dm-mod, configfs, AES, XTS) is built into 7.0.0-34.
+tsm_report
+sev-guest
+# The org CA public key arrives through fw_cfg (Phase 3).
+qemu_fw_cfg
+dm-crypt
+aesni_intel
+algif_skcipher

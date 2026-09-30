@@ -1,0 +1,14 @@
+# Rust build output, and a local `cargo vendor` tree if one is made. The pins
+# are Cargo.lock's exact versions and checksums.
+/attest/target/
+/attest/vendor/
+/attest/fuzz/target/
+/attest/fuzz/corpus/
+/attest/fuzz/artifacts/
+
+# stage 0 build output, if built inside the checkout
+/stage0/out/
+
+.DS_Store
+*.swp
+*~

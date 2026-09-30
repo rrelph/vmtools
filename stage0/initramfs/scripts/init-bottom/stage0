@@ -1,0 +1,80 @@
+#!/bin/sh
+# Stage 0's teardown, the last thing before switch_root. initramfs-tools
+# carries /run into the booted system (Phase 0), so everything stage 0 made
+# there goes now: the host key pair, sshd's config, the flags. sshd and every
+# session are stopped first. Anything left over is a panic, not a warning.
+
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "$1" in
+prereqs) prereqs; exit 0 ;;
+esac
+
+. /scripts/functions
+
+S=/run/stage0
+# initramfs-tools' init exports rootmnt, where it has mounted the guest's root.
+guest_root="${rootmnt:?}"
+log_begin_msg "stage0: teardown"
+
+# The guest's crypttab names the mapping; systemd in the booted system looks
+# for it under that name and would otherwise try to open the volume again.
+if read -r name dev < "$S/unlocked"; then
+	uuid=$(cryptsetup luksUUID "$dev")
+	want=$(awk -v u="UUID=$uuid" -v d="/dev/disk/by-uuid/$uuid" \
+		'$1 !~ /^#/ && ($2 == u || $2 == d) { print $1; exit }' "$guest_root/etc/crypttab" 2>/dev/null)
+	if [ -n "$want" ] && [ "$want" != "$name" ]; then
+		dmsetup rename "$name" "$want" || panic "stage0: cannot rename $name to $want"
+	fi
+fi
+
+# stage 0's processes: sshd, its sessions, the agent, and dhcpcd if it is
+# still around.
+stage0_pids() {
+	for p in /proc/[0-9]*; do
+		case "$(readlink "$p/exe" 2>/dev/null)" in
+		/usr/sbin/sshd | /usr/lib/openssh/sshd-session | /usr/lib/openssh/sshd-auth | \
+			/usr/sbin/stage0-agent | /usr/sbin/dhcpcd)
+			echo "${p#/proc/}" ;;
+		esac
+	done
+}
+# The unlock session is finishing its reply; give it a moment, then stop all.
+i=0
+while [ -n "$(stage0_pids | grep -vx "$(cat "$S/sshd.pid")")" ] && [ $i -lt 10 ]; do
+	sleep 1
+	i=$((i + 1))
+done
+pids=$(stage0_pids)
+[ -n "$pids" ] && kill $pids
+i=0
+while [ -n "$(stage0_pids)" ] && [ $i -lt 5 ]; do
+	sleep 1
+	i=$((i + 1))
+done
+pids=$(stage0_pids)
+[ -n "$pids" ] && kill -9 $pids && sleep 1
+[ -z "$(stage0_pids)" ] || panic "stage0: sshd did not stop"
+
+# The network is stage 0's too. The booted guest names and configures its own
+# interface; leave none configured, and none of the initrd's network state.
+for f in /run/net-*.conf /run/net6-*.conf; do
+	[ -e "$f" ] || continue
+	dev=${f#/run/net-}
+	dev=${dev#/run/net6-}
+	dev=${dev%.conf}
+	ip addr flush dev "$dev"
+	ip link set "$dev" down
+	rm -f "$f"
+done
+rm -rf /run/netplan /run/dhcpcd
+
+for d in /sys/kernel/config/tsm/report/*; do
+	[ -d "$d" ] && rmdir "$d"
+done
+[ -e "$S/mounted-configfs" ] && umount /sys/kernel/config
+[ -e "$S/made-run-sshd" ] && rmdir /run/sshd
+rm -rf "$S"
+
+[ ! -e "$S" ] || panic "stage0: $S survived teardown"
+log_end_msg

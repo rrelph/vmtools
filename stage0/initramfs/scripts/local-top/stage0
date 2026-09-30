@@ -1,0 +1,20 @@
+#!/bin/sh
+# Stage 0 waits here, however long it takes, until the agent has opened the
+# volume for a guest owner who verified this guest. Then LVM, and the stock
+# local script mounts root.
+
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "$1" in
+prereqs) prereqs; exit 0 ;;
+esac
+
+. /scripts/functions
+
+log_begin_msg "stage0: waiting for the guest owner's attested unlock"
+while [ ! -e /run/stage0/unlocked ]; do
+	sleep 1
+done
+log_end_msg
+
+lvm vgchange -a y --sysinit || panic "stage0: LVM activation failed"

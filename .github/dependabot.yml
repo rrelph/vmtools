@@ -1,0 +1,23 @@
+# Dependabot — keeps the actions used in .github/workflows current.
+#
+# Actions are pinned by full commit SHA with a "# vX.Y.Z" comment naming the
+# release. Dependabot updates both in one pull request; CI then runs
+# .github/scripts/verify-action-pins.sh, which confirms the new SHA really is
+# the commit that release tag points at. Merge only when that is green.
+#
+# The cooldown holds a new release back for a week before proposing it, so a
+# compromised release has time to be noticed and pulled upstream first. The
+# verification cannot catch that case — it proves the PR says what it does,
+# not that the release deserves trust.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "actions"

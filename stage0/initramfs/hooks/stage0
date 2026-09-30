@@ -1,0 +1,65 @@
+#!/bin/sh
+# initramfs-tools hook: stage 0 of the attested unlock
+# (design/attested-unlock-design.md, section 6). Run by build.sh, which sets
+# STAGE0_AGENT.
+#
+# The org CA is not in the image: stage 0 reads it from fw_cfg at boot and
+# checks it against host_data (scripts/init-premount/stage0), so every guest
+# boots the same image, with the same measurement.
+
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "$1" in
+prereqs) prereqs; exit 0 ;;
+esac
+
+set -e
+. /usr/share/initramfs-tools/hook-functions
+: "${STAGE0_AGENT:?set by build.sh}"
+
+# OpenSSH 10 splits the daemon in three; all three are needed.
+copy_exec /usr/sbin/sshd
+copy_exec /usr/lib/openssh/sshd-session
+copy_exec /usr/lib/openssh/sshd-auth
+copy_exec /usr/bin/ssh-keygen
+copy_exec /usr/sbin/cryptsetup
+copy_exec /usr/sbin/dmsetup
+copy_exec /usr/sbin/lvm
+# initramfs-tools finds the root filesystem's type with blkid, which the stock
+# image gets from the udev hook; stage 0 has no udev.
+copy_exec /usr/sbin/blkid
+copy_exec "$STAGE0_AGENT" /usr/sbin/stage0-agent
+cp "$CONFDIR/wait-for-root" "$DESTDIR/usr/sbin/wait-for-root"
+
+mkdir -p "$DESTDIR/etc/stage0" "$DESTDIR/etc/lvm" "$DESTDIR/root"
+# The dhcpcd hook copies its user from the build host, whose uid differs from
+# host to host (Phase 2). Fix it, so the image does not depend on the host.
+sed -i 's|^dhcpcd:.*|dhcpcd:x:100:65534:DHCP Client Daemon:/usr/lib/dhcpcd:/bin/false|' "$DESTDIR/etc/passwd"
+
+# dhcpcd chroots into its user's home for privilege separation, and refuses
+# (then exits, leaving stage 0 without a network) unless that directory
+# exists, is root's, and is not group- or world-writable. The dhcpcd hook
+# copies the user from the build host but not the directory.
+dhcpcd_home=$(awk -F: '$1 == "dhcpcd" { print $6 }' "$DESTDIR/etc/passwd")
+if [ -n "$dhcpcd_home" ]; then
+	mkdir -p "$DESTDIR$dhcpcd_home"
+	chmod 0755 "$DESTDIR$dhcpcd_home"
+fi
+# Stage 0 runs no udev, and dhcpcd with its udev plugin loaded exits without
+# configuring anything. Without the plugin it finds interfaces by netlink.
+rm -f "$DESTDIR"/usr/lib/*/dhcpcd/dev/udev.so
+# The one principal a member certificate must carry.
+echo unlock > "$DESTDIR/etc/stage0/principals"
+
+# root, for the ForceCommand session, and sshd's privilege-separation user.
+# Appended: the dhcpcd hook has already added its own user.
+echo 'root:x:0:0:root:/root:/bin/sh' >> "$DESTDIR/etc/passwd"
+echo 'sshd:x:74:65534:sshd privsep:/run/sshd:/bin/false' >> "$DESTDIR/etc/passwd"
+printf 'root:x:0:\nnogroup:x:65534:\n' >> "$DESTDIR/etc/group"
+
+# LVM without udev: lvm makes its own device nodes.
+cat > "$DESTDIR/etc/lvm/lvm.conf" <<'LVM'
+devices { obtain_device_list_from_udev = 0 external_device_info_source = "none" }
+activation { udev_sync = 0 udev_rules = 0 monitoring = 0 }
+backup { backup = 0 archive = 0 }
+LVM

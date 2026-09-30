@@ -1,0 +1,42 @@
+# The attested-unlock workspace (design/attested-unlock-design.md).
+#
+#   snp           report parsing and the section 8 checks (library)
+#   stage0-agent  runs inside stage 0 as sshd's ForceCommand (x86_64 guest)
+#   vmt-unlock    the guest owner's unlock tool
+#
+# Every dependency is pinned exactly: `=` versions here, and Cargo.lock holds
+# the whole graph with each crate's checksum. Build and test with --locked,
+# which refuses to change the lock; crates come from crates.io and are
+# checked against it. Vendoring is deferred to Phase 6 (design log, r49).
+[workspace]
+resolver = "3"
+members = ["snp", "stage0-agent", "vmt-unlock"]
+# cargo-fuzz targets; development only, with their own lock (fuzz/Cargo.toml).
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+# RustCrypto, one generation throughout (the one virtee's `sev` 8 uses).
+# Build-time code in this graph: der_derive (proc macro, via der), and
+# build.rs in generic-array, num-traits, num-integer, num-bigint-dig, libm,
+# proc-macro2, quote. See design/phase1-findings.md, "Dependencies".
+sha2 = { version = "=0.10.9", default-features = false }
+p384 = { version = "=0.13.1", default-features = false, features = ["ecdsa"] }
+rsa = { version = "=0.9.10", default-features = false }
+x509-cert = { version = "=0.2.5", default-features = false }
+# The terminal, for the passphrase prompt (vmt-unlock only). Already in the
+# graph, through sha2's cpufeatures; it has a build.rs.
+libc = { version = "=0.2.189", default-features = false }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

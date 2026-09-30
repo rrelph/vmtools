@@ -1,0 +1,44 @@
+# ci — every push and pull request: the Rust workspace's tests and formatting,
+# ShellCheck on stage 0's scripts, and the action pins.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      # Pinned to a full commit SHA, not a tag: a tag can be moved to other code,
+      # a SHA cannot. The trailing comment names the release. Dependabot proposes
+      # updates; .github/scripts/verify-action-pins.sh proves the SHA is that release.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: action pins match their releases
+        run: bash .github/scripts/verify-action-pins.sh
+
+      # Formatting is not cosmetic here: the stage 0 agent's binary, and so
+      # every guest's launch measurement, changes with its source layout, so a
+      # reformat must land with the stage 0 rebuild it causes, not later.
+      - name: cargo fmt --check
+        run: |
+          cargo fmt --version
+          (cd attest && cargo fmt --check)
+          (cd attest/fuzz && cargo fmt --check)
+
+      - name: cargo test --locked
+        run: |
+          cargo --version
+          cd attest && cargo test --locked
+
+      - name: shellcheck
+        run: |
+          command -v shellcheck >/dev/null || sudo apt-get install -y -qq shellcheck
+          bash .github/scripts/shellcheck.sh

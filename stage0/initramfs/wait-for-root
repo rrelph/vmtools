@@ -1,0 +1,18 @@
+#!/bin/sh
+# wait-for-root <device> <timeout>: stage 0's stand-in for initramfs-tools'
+# program of the same name, which asks udev and so, with no udev, waits out
+# its whole timeout. Poll for the block device, then print its filesystem
+# type, as the original does. Only /dev paths: stage 0's root= is one.
+dev=$1
+timeout=${2:-30}
+case "$dev" in
+/dev/*) ;;
+*) exit 1 ;;
+esac
+i=0
+while [ ! -b "$dev" ]; do
+	[ "$i" -ge "$timeout" ] && exit 1
+	sleep 1
+	i=$((i + 1))
+done
+blkid -s TYPE -o value "$dev"
