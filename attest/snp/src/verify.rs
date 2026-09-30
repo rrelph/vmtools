@@ -239,23 +239,23 @@ pub fn verify(report: &Report, vcek_der: &[u8], chain: &AmdChain, exp: &Expectat
     };
     checks.push(check(7, "VMPL", format!("VMPL {}", report.vmpl), fails));
 
-    // 8. host_data: the organization's CA. Stage 0 refuses to start sshd
-    // unless the CA it was given hashes to this; this check is the guest
+    // 8. host_data: the server unlock key. Stage 0 refuses to start sshd
+    // unless the key it was given hashes to this; this check is the guest
     // owner's own confirmation, and it can only pass or fail.
     let fails = if report.host_data == exp.host_data {
         vec![]
     } else {
-        vec!["host_data is not your organization's CA: this VM was started for a different CA".into()]
+        vec!["host_data is not your server unlock key: this VM was started for a different key".into()]
     };
     let fp = crate::sshkey::fingerprint_of_digest;
     let detail = format!(
-        "expected {} (your CA, {})\nreported {} ({})",
+        "expected {} (your server unlock key, {})\nreported {} ({})",
         hex(&exp.host_data),
         fp(&exp.host_data),
         hex(&report.host_data),
         fp(&report.host_data)
     );
-    checks.push(check(8, "host_data (org CA binding)", detail, fails));
+    checks.push(check(8, "host_data (server unlock key)", detail, fails));
 
     // 9. TCB minimums.
     let fails = if report.reported_tcb.meets(&exp.min_tcb) {

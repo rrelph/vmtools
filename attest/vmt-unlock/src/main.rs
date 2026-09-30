@@ -87,7 +87,7 @@ struct Opts {
     server: Option<String>,
     target: ssh::Target,
     key: KeySource,
-    /// host_data the report must carry, from --org-ca.
+    /// host_data the report must carry, from the server unlock key.
     host_data: [u8; 32],
     measurements: Vec<[u8; 48]>,
     min_tcb: Tcb,

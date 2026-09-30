@@ -59,7 +59,7 @@ pub fn title(n: u8) -> &'static str {
         5 => "the software your VM started with",
         6 => "the rules your VM was started under",
         7 => "from the most trusted level of your VM",
-        8 => "started for your organization",
+        8 => "started for your server unlock key",
         9 => "processor firmware is up to date",
         10 => "a processor you have seen before",
         _ => "",
@@ -117,12 +117,13 @@ running something else."
         }
         8 => {
             "\
-Your VM was started with a fingerprint of the certificate authority key that
-decides who may unlock it: your organization's. The unlock system itself
-refused to start unless the key it was given matches that fingerprint, and
-here you check the fingerprint against your own copy of the key. A different
-value means the VM was started for someone else's key, and anyone holding
-certificates from that key could be the one you are talking to."
+Your VM was started with a fingerprint of its server unlock key: the key that
+decides who may unlock it, which is yours (on a server only you unlock, your
+own SSH key). The unlock system itself refused to start unless the key it was
+given matches that fingerprint, and here you check the fingerprint against
+your own copy of the key. A different value means the VM was started for
+someone else's key, and whoever holds that key could be the one you are
+talking to."
         }
         9 => {
             "\
@@ -151,7 +152,7 @@ STOP. At least one check failed, so your passphrase was NOT sent.
 Treat this as a security event. It can mean someone is trying to get your
 passphrase. Do not run the tool again to see if it works the second time,
 and do not give your passphrase any other way. Keep the evidence below, and
-contact us and your organization's security contact.";
+contact us, and whoever looks after security for you.";
 
 pub const DONE: &str = "\
 Your VM is starting its own system. In a minute or so you can log in as
