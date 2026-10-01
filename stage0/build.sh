@@ -14,9 +14,12 @@
 # Runs unprivileged on an Ubuntu 26.04 x86_64 machine with initramfs-tools-core,
 # 3cpio, busybox-initramfs, klibc-utils, kmod, dhcpcd-base, openssh-server,
 # cryptsetup-bin, lvm2, linux-modules-<kernel> and cargo installed (Milan has
-# them), and sev-snp-measure on PATH or in ~/.local/bin. sev-snp-measure is
-# Python and is used here only to compute the expected measurement, which the
-# guest owner's own check then confirms or refuses.
+# them). The expected measurement is computed by this checkout's own Rust port
+# of sev-snp-measure (attest/sev-snp-measure), built here like the agent: no
+# Python and nothing from PyPI. The guest's signed report confirms or refuses
+# the value at every unlock, so a wrong one can stop an unlock but never pass a
+# wrong guest; a guest owner reproduces it with the same port and, if they
+# choose, VirTEE's original.
 #
 # - The agent is built here, from this repository's attest/, with
 #   cargo --locked and every build path remapped (--remap-path-prefix), so the
@@ -45,7 +48,13 @@ umask 022
 export LC_ALL=C
 
 KVER=7.0.0-34-generic
+# The measurement's inputs besides the files and the command line, passed to
+# the calculator explicitly rather than left to its defaults, and recorded in
+# the manifest. The measurement guide passes the same values: change them
+# together.
 VCPU_TYPE=EPYC-Milan
+GUEST_FEATURES=0x1  # SEV features in each vCPU's VMSA; 0x1 is SNPActive alone
+VMM_TYPE=QEMU       # whose initial register state the calculator models
 OUT="" OVMF="" VCPUS=4
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -59,9 +68,7 @@ done
 [ -r "$OVMF" ] || die "--ovmf: not readable: $OVMF"
 [ -n "$OUT" ] || die "--out is required"
 [[ "$VCPUS" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || die "--vcpus: a comma-separated list of counts"
-MEASURE="$(command -v sev-snp-measure || echo "$HOME/.local/bin/sev-snp-measure")"
-[ -x "$MEASURE" ] || die "sev-snp-measure not found; the manifest needs the expected measurement"
-command -v cargo >/dev/null || die "cargo not found; it builds the agent"
+command -v cargo >/dev/null || die "cargo not found; it builds the agent and the calculator"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
@@ -104,6 +111,20 @@ AGENT="$WORK/target/release/stage0-agent"
 if grep -aqF -e "$HOME" -e "$REPO" -e "$WORK" "$AGENT"; then
     die "the agent still contains a path of this machine"
 fi
+
+# --- the calculator: this checkout's port of sev-snp-measure ---
+# The same commit as the agent (source.commit), in a target directory of its
+# own so it cannot touch the agent's build. --no-default-features leaves out
+# its ID-block tool, which is never used here.
+cargo build --quiet --release --locked --manifest-path "$REPO/attest/Cargo.toml" \
+    -p sev-snp-measure --bin sev-snp-measure --no-default-features --target-dir "$WORK/calculator"
+MEASURE="$WORK/calculator/release/sev-snp-measure"
+# Recorded in the manifest as provenance only. The measurement is fixed by its
+# inputs, every one of which the manifest names, and the guest's signed report
+# checks it at every unlock; which program did the arithmetic does not change
+# that, so nothing checks this line.
+CALCULATOR="$("$MEASURE" --version)"
+[ -n "$CALCULATOR" ] || die "the calculator printed no version"
 
 # --- kernel, from the signed package ---
 ( cd "$WORK" && apt-get download -q "linux-image-$KVER=$kpkg" >/dev/null )
@@ -207,13 +228,16 @@ M="$OUT/manifest"
     echo "ovmf.sha256 $(sha "$OVMF")"
     [ -z "$ovmf_lines" ] || printf '%s\n' "$ovmf_lines"
     echo "vcpu.type $VCPU_TYPE"
+    echo "guest.features $GUEST_FEATURES"
+    echo "vmm.type $VMM_TYPE"
     for n in ${VCPUS//,/ }; do
-        m="$("$MEASURE" --mode snp --vcpus "$n" --vcpu-type "$VCPU_TYPE" --ovmf "$OVMF" \
+        m="$("$MEASURE" --mode snp --vcpus "$n" --vcpu-type "$VCPU_TYPE" \
+             --guest-features "$GUEST_FEATURES" --vmm-type "$VMM_TYPE" --ovmf "$OVMF" \
              --kernel "$OUT/vmlinuz" --initrd "$OUT/initrd.img" --append "$CMDLINE")"
         [[ "$m" =~ ^[0-9a-f]{96}$ ]] || die "sev-snp-measure gave no measurement for $n vCPUs"
         echo "measurement.vcpus.$n $m"
     done
-    echo "measurement.tool sev-snp-measure $("$MEASURE" --version 2>/dev/null | awk '{print $NF}')"
+    echo "calculator $CALCULATOR"
     echo "agent.sha256 $(sha "$AGENT")"
     echo "agent.rustc $(rustc -V)"
     echo "source-date-epoch $SOURCE_DATE_EPOCH"
