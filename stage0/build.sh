@@ -48,7 +48,13 @@ umask 022
 export LC_ALL=C
 
 KVER=7.0.0-34-generic
+# The measurement's inputs besides the files and the command line, passed to
+# the calculator explicitly rather than left to its defaults, and recorded in
+# the manifest. The measurement guide passes the same values: change them
+# together.
 VCPU_TYPE=EPYC-Milan
+GUEST_FEATURES=0x1  # SEV features in each vCPU's VMSA; 0x1 is SNPActive alone
+VMM_TYPE=QEMU       # whose initial register state the calculator models
 OUT="" OVMF="" VCPUS=4
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -114,10 +120,9 @@ cargo build --quiet --release --locked --manifest-path "$REPO/attest/Cargo.toml"
     -p sev-snp-measure --bin sev-snp-measure --no-default-features --target-dir "$WORK/calculator"
 MEASURE="$WORK/calculator/release/sev-snp-measure"
 # Recorded in the manifest as provenance only. The measurement is fixed by its
-# inputs (the files, command line and vCPU count and type the manifest names,
-# and the guest features and VMM type, left at the calculator's defaults), and
-# the guest's signed report checks it at every unlock; which program did the
-# arithmetic does not change that, so nothing checks this line.
+# inputs, every one of which the manifest names, and the guest's signed report
+# checks it at every unlock; which program did the arithmetic does not change
+# that, so nothing checks this line.
 CALCULATOR="$("$MEASURE" --version)"
 [ -n "$CALCULATOR" ] || die "the calculator printed no version"
 
@@ -223,8 +228,11 @@ M="$OUT/manifest"
     echo "ovmf.sha256 $(sha "$OVMF")"
     [ -z "$ovmf_lines" ] || printf '%s\n' "$ovmf_lines"
     echo "vcpu.type $VCPU_TYPE"
+    echo "guest.features $GUEST_FEATURES"
+    echo "vmm.type $VMM_TYPE"
     for n in ${VCPUS//,/ }; do
-        m="$("$MEASURE" --mode snp --vcpus "$n" --vcpu-type "$VCPU_TYPE" --ovmf "$OVMF" \
+        m="$("$MEASURE" --mode snp --vcpus "$n" --vcpu-type "$VCPU_TYPE" \
+             --guest-features "$GUEST_FEATURES" --vmm-type "$VMM_TYPE" --ovmf "$OVMF" \
              --kernel "$OUT/vmlinuz" --initrd "$OUT/initrd.img" --append "$CMDLINE")"
         [[ "$m" =~ ^[0-9a-f]{96}$ ]] || die "sev-snp-measure gave no measurement for $n vCPUs"
         echo "measurement.vcpus.$n $m"
