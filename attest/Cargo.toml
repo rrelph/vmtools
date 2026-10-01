@@ -3,6 +3,8 @@
 #   snp           report parsing and the section 8 checks (library)
 #   stage0-agent  runs inside stage 0 as sshd's ForceCommand (x86_64 guest)
 #   vmt-unlock    the guest owner's unlock tool
+#   sev-snp-measure  launch measurement calculator; a Rust port of
+#                 virtee/sev-snp-measure 0.0.13, Apache-2.0 like its source
 #
 # Every dependency is pinned exactly: `=` versions here, and Cargo.lock holds
 # the whole graph with each crate's checksum. Build and test with --locked,
@@ -10,7 +12,7 @@
 # checked against it. Vendoring is deferred to Phase 6 (design log, r49).
 [workspace]
 resolver = "3"
-members = ["snp", "stage0-agent", "vmt-unlock"]
+members = ["snp", "stage0-agent", "vmt-unlock", "sev-snp-measure"]
 # cargo-fuzz targets; development only, with their own lock (fuzz/Cargo.toml).
 exclude = ["fuzz"]
 
@@ -27,6 +29,9 @@ publish = false
 # build.rs in generic-array, num-traits, num-integer, num-bigint-dig, libm,
 # proc-macro2, quote. See design/phase1-findings.md, "Dependencies".
 sha2 = { version = "=0.10.9", default-features = false }
+# sev-snp-measure adds p384's `pem` feature for its ID-block keys, which
+# brings in pem-rfc7468 (no build.rs; its one dependency, base64ct, is
+# already here).
 p384 = { version = "=0.13.1", default-features = false, features = ["ecdsa"] }
 rsa = { version = "=0.9.10", default-features = false }
 x509-cert = { version = "=0.2.5", default-features = false }

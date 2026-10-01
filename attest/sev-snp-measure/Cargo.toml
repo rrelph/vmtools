@@ -1,0 +1,30 @@
+[package]
+name = "sev-snp-measure"
+description = "Calculate AMD SEV/SEV-ES/SEV-SNP guest launch measurements (a Rust port of virtee/sev-snp-measure 0.0.13)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# Not the workspace's MIT OR Apache-2.0: this is a translation of IBM's
+# Apache-2.0 Python, and stays under its license.
+license = "Apache-2.0"
+publish.workspace = true
+
+[dependencies]
+sha2.workspace = true
+# `pem` reads the ID-block signing keys (SEC 1 and PKCS #8 PEM).
+p384 = { workspace = true, optional = true, features = ["pem"] }
+
+[features]
+default = ["id-block"]
+# snp-create-id-block: the only part that needs elliptic-curve code.
+# `--no-default-features` builds the measurement calculator on sha2 alone.
+id-block = ["dep:p384"]
+
+[[bin]]
+name = "sev-snp-measure"
+path = "src/bin/sev-snp-measure.rs"
+
+[[bin]]
+name = "snp-create-id-block"
+path = "src/bin/snp-create-id-block.rs"
+required-features = ["id-block"]
