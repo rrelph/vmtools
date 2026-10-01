@@ -44,7 +44,8 @@ The port is ours, so the original stays the independent check: it runs from
 its own repository, at the v0.0.13 commit, on the Python a Mac already has
 (its measurement calculator needs only Python's standard library). The
 hosting operator's measurement guide walks through both. `stage0/build.sh`
-computes the published measurement with the original, not the port.
+computes the published measurement with the port too, built from its own
+checkout: nothing in the chain installs Python or anything from PyPI.
 
 ### What a build of the workspace produces
 
