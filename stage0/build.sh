@@ -16,7 +16,10 @@
 # cryptsetup-bin, lvm2, linux-modules-<kernel> and cargo installed (Milan has
 # them), and sev-snp-measure on PATH or in ~/.local/bin. sev-snp-measure is
 # Python and is used here only to compute the expected measurement, which the
-# guest owner's own check then confirms or refuses.
+# guest owner's own check then confirms or refuses. It must be the Python
+# original, not this repository's Rust port (attest/sev-snp-measure): the
+# published measurement comes from the original, and owners check it with the
+# port and, if they choose, the original.
 #
 # - The agent is built here, from this repository's attest/, with
 #   cargo --locked and every build path remapped (--remap-path-prefix), so the
@@ -61,6 +64,12 @@ done
 [[ "$VCPUS" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || die "--vcpus: a comma-separated list of counts"
 MEASURE="$(command -v sev-snp-measure || echo "$HOME/.local/bin/sev-snp-measure")"
 [ -x "$MEASURE" ] || die "sev-snp-measure not found; the manifest needs the expected measurement"
+# The original prints exactly "sev-snp-measure X.Y.Z"; the port adds its own
+# version and "(Rust port of sev-snp-measure X.Y.Z)", and is refused.
+MEASURE_VERSION="$("$MEASURE" --version 2>/dev/null || true)"
+[[ "$MEASURE_VERSION" =~ ^sev-snp-measure\ ([0-9]+\.[0-9]+\.[0-9]+)$ ]] \
+    || die "$MEASURE is not the Python sev-snp-measure (--version printed: ${MEASURE_VERSION:-nothing})"
+MEASURE_VERSION="${BASH_REMATCH[1]}"
 command -v cargo >/dev/null || die "cargo not found; it builds the agent"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -213,7 +222,7 @@ M="$OUT/manifest"
         [[ "$m" =~ ^[0-9a-f]{96}$ ]] || die "sev-snp-measure gave no measurement for $n vCPUs"
         echo "measurement.vcpus.$n $m"
     done
-    echo "measurement.tool sev-snp-measure $("$MEASURE" --version 2>/dev/null | awk '{print $NF}')"
+    echo "measurement.tool sev-snp-measure $MEASURE_VERSION"
     echo "agent.sha256 $(sha "$AGENT")"
     echo "agent.rustc $(rustc -V)"
     echo "source-date-epoch $SOURCE_DATE_EPOCH"
