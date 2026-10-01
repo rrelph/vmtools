@@ -1,5 +1,5 @@
 # ci — every push and pull request: the Rust workspace's tests and formatting,
-# ShellCheck on stage 0's scripts, and the action pins.
+# ShellCheck on stage 0's scripts, the action pins, and one version throughout.
 name: ci
 
 on:
@@ -23,6 +23,11 @@ jobs:
 
       - name: action pins match their releases
         run: bash .github/scripts/verify-action-pins.sh
+
+      # One version for the workspace, and on a tag push, a tag that names it
+      # (vmtools-X.Y.Z). The version reaches the stage 0 agent's binary.
+      - name: versions match the workspace and the tag
+        run: bash .github/scripts/check-versions.sh
 
       # Formatting is not cosmetic here: the stage 0 agent's binary, and so
       # every guest's launch measurement, changes with its source layout, so a

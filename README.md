@@ -19,7 +19,7 @@ Owners install `vmt-unlock` from a release tag, with the versions of every
 library pinned by `Cargo.lock`:
 
 ```sh
-cargo install --locked --git https://github.com/rrelph/vmtools --tag vmt-unlock-0.4.0 vmt-unlock
+cargo install --locked --git https://github.com/rrelph/vmtools --tag vmtools-0.6.0 vmt-unlock
 ```
 
 Naming `vmt-unlock` matters: the workspace builds several programs, and
@@ -29,10 +29,10 @@ Naming `vmt-unlock` matters: the workspace builds several programs, and
 
 The unlock tool checks the VM's launch measurement against the value its
 owner was sent. To compute that value themselves, owners build the
-calculator and the unpacker, from release `vmt-unlock-0.5.0` on:
+calculator and the unpacker (in every release from 0.5.0):
 
 ```sh
-cargo install --locked --no-default-features --git https://github.com/rrelph/vmtools --tag vmt-unlock-0.5.0 --root ~/vmt-measure sev-snp-measure vmt-unzstd
+cargo install --locked --no-default-features --git https://github.com/rrelph/vmtools --tag vmtools-0.6.0 --root ~/vmt-measure sev-snp-measure vmt-unzstd
 ```
 
 `--no-default-features` leaves out `snp-create-id-block`, the port's ID-block
@@ -63,6 +63,22 @@ computes the published measurement with the original, not the port.
 - Test binaries, with `cargo test`: `snp`, `fixtures`, `snpguest`, `guest`
   (the port's launch-digest vectors, from the original's test suite), and
   the programs' own.
+
+## Versions
+
+The workspace has one version, in `attest/Cargo.toml`, and every program
+reports it (`--version`): a number names a release, meaning this source and
+this `Cargo.lock`, not one program's changes. Releases are tagged
+`vmtools-X.Y.Z`; CI fails a member that sets its own version and a tag that
+does not match (`.github/scripts/check-versions.sh`). Tags up to
+`vmt-unlock-0.5.0` predate the scheme: in those, `vmt-unlock` kept its own
+version (0.4.0 at both `vmt-unlock-0.4.0` and `vmt-unlock-0.5.0`).
+
+**A new version changes stage 0's measurement.** Cargo mixes each package's
+version into the hashes compiled into the binary, so the stage 0 agent built
+from a new release differs even where its source does not. Moving to a new
+release does not by itself call for a stage 0 rebuild: the next rebuild (for
+a kernel update, say) picks it up, with its new measurements.
 
 ## Building and testing
 
