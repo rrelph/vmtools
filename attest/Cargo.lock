@@ -389,6 +389,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruzstd"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a252f5e20f038fe7b4ea53e073e65398d652c864cc162fc77c56c2f13717b888"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "sec1"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -404,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "sev-snp-measure"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "p384",
  "sha2",
@@ -439,7 +448,7 @@ checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
 
 [[package]]
 name = "snp"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "p384",
  "rsa",
@@ -465,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "stage0-agent"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "snp",
 ]
@@ -486,6 +495,12 @@ dependencies = [
  "quote",
  "unicode-ident",
 ]
+
+[[package]]
+name = "twox-hash"
+version = "2.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5283634e518fe9e82c7b20520bb4bc209009fd16c82077c802f8111ecbb0117a"
 
 [[package]]
 name = "typenum"
@@ -512,6 +527,14 @@ dependencies = [
  "libc",
  "sha2",
  "snp",
+]
+
+[[package]]
+name = "vmt-unzstd"
+version = "0.5.0"
+dependencies = [
+ "ruzstd",
+ "sha2",
 ]
 
 [[package]]
