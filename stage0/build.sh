@@ -113,14 +113,13 @@ fi
 cargo build --quiet --release --locked --manifest-path "$REPO/attest/Cargo.toml" \
     -p sev-snp-measure --bin sev-snp-measure --no-default-features --target-dir "$WORK/calculator"
 MEASURE="$WORK/calculator/release/sev-snp-measure"
-# It prints "sev-snp-measure <release> (Rust port of sev-snp-measure X.Y.Z)".
-# X.Y.Z, the version of the original it computes like, goes in the manifest's
-# measurement.tool line, which the measurement guide checks; the whole line
-# goes in its calculator line.
+# Recorded in the manifest as provenance only. The measurement is fixed by its
+# inputs (the files, command line and vCPU count and type the manifest names,
+# and the guest features and VMM type, left at the calculator's defaults), and
+# the guest's signed report checks it at every unlock; which program did the
+# arithmetic does not change that, so nothing checks this line.
 CALCULATOR="$("$MEASURE" --version)"
-[[ "$CALCULATOR" =~ \(Rust\ port\ of\ sev-snp-measure\ ([0-9]+\.[0-9]+\.[0-9]+)\)$ ]] \
-    || die "the calculator did not identify itself as expected: $CALCULATOR"
-MEASURE_VERSION="${BASH_REMATCH[1]}"
+[ -n "$CALCULATOR" ] || die "the calculator printed no version"
 
 # --- kernel, from the signed package ---
 ( cd "$WORK" && apt-get download -q "linux-image-$KVER=$kpkg" >/dev/null )
@@ -230,7 +229,6 @@ M="$OUT/manifest"
         [[ "$m" =~ ^[0-9a-f]{96}$ ]] || die "sev-snp-measure gave no measurement for $n vCPUs"
         echo "measurement.vcpus.$n $m"
     done
-    echo "measurement.tool sev-snp-measure $MEASURE_VERSION"
     echo "calculator $CALCULATOR"
     echo "agent.sha256 $(sha "$AGENT")"
     echo "agent.rustc $(rustc -V)"
