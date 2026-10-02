@@ -92,6 +92,11 @@ OUT="$(realpath "$OUT")"
 WORK="$(mktemp -d)"
 ROOT="$WORK/root"
 B=/home/builder            # the build user's home inside the root
+# Run as the build user, looked up inside the root: setpriv runs there, so
+# the name resolves against the root's /etc/passwd. chroot --userspec looks
+# it up on the host under uutils coreutils (Ubuntu 26.04's chroot), where
+# there is no builder: "chroot: invalid user" (Milan, 2026-10-02).
+AS_BUILDER=(setpriv --reuid=builder --regid=builder --init-groups)
 
 # Never delete the root while anything is still mounted inside it: /dev is
 # bound from the host. Unmount, check, and only then remove, on this file
@@ -159,7 +164,7 @@ fi
 g bundle create "$WORK/vmtools.bundle" HEAD 2>/dev/null
 install -m 0644 "$WORK/vmtools.bundle" "$ROOT$B/vmtools.bundle"
 [ "$CHANGES" = 0 ] || g diff --binary HEAD > "$ROOT$B/changes.patch"
-chroot --userspec=builder:builder "$ROOT" env -i HOME="$B" PATH=/usr/bin:/bin \
+chroot "$ROOT" "${AS_BUILDER[@]}" env -i HOME="$B" PATH=/usr/bin:/bin \
     bash -c "set -e; cd $B && git -c advice.detachedHead=false clone -q vmtools.bundle vmtools \
              && git -c advice.detachedHead=false -C vmtools checkout -q $COMMIT \
              && if [ -s $B/changes.patch ]; then git -C vmtools apply $B/changes.patch; fi"
@@ -173,7 +178,7 @@ if [ -e "$ROOT/etc/ssl/certs/build-proxy-ca.crt" ]; then
     ENVS+=(SSL_CERT_FILE=/etc/ssl/certs/build-proxy-ca.crt CARGO_HTTP_CAINFO=/etc/ssl/certs/build-proxy-ca.crt)
 fi
 echo "build.sh: building the agent, the calculator and the initrd in the root" >&2
-chroot --userspec=builder:builder "$ROOT" env -i "${ENVS[@]}" \
+chroot "$ROOT" "${AS_BUILDER[@]}" env -i "${ENVS[@]}" \
     bash "$B/vmtools/stage0/image.sh" --ovmf "$B/OVMF.amdsev.fd" --out "$B/out" \
          --vcpus "$VCPUS" --kernel "$KVER" >/dev/null \
     || die "image.sh failed in the build root (above)"
