@@ -1,260 +1,165 @@
 #!/usr/bin/env bash
-# stage0/build.sh — build stage 0: kernel, initrd and command line for
-# measured direct boot (design/attested-unlock-design.md, sections 5 and 6).
+# stage0/build.sh — build stage 0 from Ubuntu's archive alone.
 #
-#   usage: build.sh --ovmf <OVMF.fd> --out <dir>
-#                   [--vcpus 4[,8,...]] [--kernel <version>]
+#   usage: sudo build.sh --ovmf <OVMF.fd> --out <dir>
+#                        [--vcpus 4[,8,...]] [--kernel <version>]
+#                        [--snapshot <YYYYMMDDTHHMMSSZ>] [--allow-changes]
 #
-# Writes <dir>/vmlinuz, <dir>/initrd.img and <dir>/manifest. The manifest is
-# the one record of the build: the files and their digests, the command line,
-# the package versions, and the launch measurement a guest booted from it must
-# report, per vCPU count. install.sh takes the command line from it; nothing
-# else should keep a copy.
+# Makes a throwaway Ubuntu 26.04 root from Ubuntu's archive as it was at one
+# moment (snapshot.ubuntu.com; --snapshot, default now), puts this checkout's
+# commit in it, and runs image.sh there as an unprivileged user. Everything
+# the image is made of, and every tool that assembles, compresses and
+# measures it, the agent's compiler included, comes from that root: nothing
+# the build host has installed reaches stage 0, so updating or rebooting the
+# host never changes what guests run, and the host need not be updated to
+# rebuild. The manifest records the snapshot; with the commit, the kernel and
+# the firmware, that is all a rebuild of the same bytes needs, on any machine
+# with mmdebstrap.
 #
-# Runs unprivileged on an Ubuntu 26.04 x86_64 machine with initramfs-tools-core,
-# 3cpio, busybox-initramfs, klibc-utils, kmod, dhcpcd-base, openssh-server,
-# cryptsetup-bin, lvm2, linux-modules-<kernel> and cargo installed (Milan has
-# them). The expected measurement is computed by this checkout's own Rust port
-# of sev-snp-measure (attest/sev-snp-measure), built here like the agent: no
-# Python and nothing from PyPI. The guest's signed report confirms or refuses
-# the value at every unlock, so a wrong one can stop an unlock but never pass a
-# wrong guest; a guest owner reproduces it with the same port and, if they
-# choose, VirTEE's original.
+# Writes <dir>/vmlinuz, <dir>/initrd.img and <dir>/manifest (image.sh says
+# what they hold), owned by the user who ran sudo.
 #
-# - The agent is built here, from this repository's attest/, with
-#   cargo --locked and every build path remapped (--remap-path-prefix), so the
-#   binary does not depend on who builds it or where.
-# - The kernel comes from the signed linux-image package, fetched with
-#   apt-get download, not from the build host's /boot.
-# - mkinitramfs runs from a private copy of initramfs-tools holding only
-#   initramfs-tools-core's own files and four hooks (busybox, klibc, kmod,
-#   dhcpcd), with its hard-coded /usr/share/initramfs-tools and host
-#   modprobe.d paths rewritten to that copy and to an empty directory.
-#   Nothing else the host has installed gets in. No namespaces, no root:
-#   Ubuntu restricts unprivileged user namespaces by default.
-# - SOURCE_DATE_EPOCH is fixed, so two builds from the same packages should
-#   produce the same bytes (checked in Phase 1; see the findings).
+# Needs root, for mmdebstrap's root mode and the chroot: Ubuntu restricts
+# unprivileged user namespaces by default. Needs mmdebstrap and the build
+# host's Ubuntu archive keyring, which checks the snapshot's signatures; the
+# root's own keyring checks them from then on. Network: the snapshot, and
+# crates.io for the agent's locked dependencies.
 #
-# No organization's key is in the image: stage 0 reads the org CA from fw_cfg
-# and checks it against host_data at boot (install.sh --org-ca sets both), so
-# one build serves every guest.
+# --allow-changes builds a checkout with uncommitted changes to tracked files,
+# for development; the manifest then names the commit followed by +changes,
+# and such a build is never for guests.
 
 set -euo pipefail
 
 die() { echo "build.sh: $*" >&2; exit 1; }
 umask 022
-# Sorting, in the manifest and inside mkinitramfs, must not depend on who runs
-# this (Phase 2: two locales, two orders).
 export LC_ALL=C
 
 KVER=7.0.0-34-generic
-# The measurement's inputs besides the files and the command line, passed to
-# the calculator explicitly rather than left to its defaults, and recorded in
-# the manifest. The measurement guide passes the same values: change them
-# together.
-VCPU_TYPE=EPYC-Milan
-GUEST_FEATURES=0x1  # SEV features in each vCPU's VMSA; 0x1 is SNPActive alone
-VMM_TYPE=QEMU       # whose initial register state the calculator models
-OUT="" OVMF="" VCPUS=4
+OUT="" OVMF="" VCPUS=4 SNAPSHOT="" CHANGES=0
 while [ $# -gt 0 ]; do
     case "$1" in
-        --ovmf)   OVMF="$(realpath "$2")"; shift 2 ;;
-        --out)    OUT="$2"; shift 2 ;;
-        --vcpus)  VCPUS="$2"; shift 2 ;;
-        --kernel) KVER="$2"; shift 2 ;;
+        --ovmf)          OVMF="$(realpath "$2")"; shift 2 ;;
+        --out)           OUT="$2"; shift 2 ;;
+        --vcpus)         VCPUS="$2"; shift 2 ;;
+        --kernel)        KVER="$2"; shift 2 ;;
+        --snapshot)      SNAPSHOT="$2"; shift 2 ;;
+        --allow-changes) CHANGES=1; shift ;;
         *) die "unknown argument: $1" ;;
     esac
 done
+[ "$(id -u)" = 0 ] || die "run with sudo: it makes and enters the build root (the image itself is built inside as an unprivileged user)"
 [ -r "$OVMF" ] || die "--ovmf: not readable: $OVMF"
+[ "$(basename "$OVMF")" = OVMF.amdsev.fd ] || die "--ovmf: expected a file named OVMF.amdsev.fd, ovmf-amdsev's"
 [ -n "$OUT" ] || die "--out is required"
 [[ "$VCPUS" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || die "--vcpus: a comma-separated list of counts"
-command -v cargo >/dev/null || die "cargo not found; it builds the agent and the calculator"
+[[ "$KVER" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-generic$ ]] || die "--kernel: a release such as 7.0.0-34-generic"
+: "${SNAPSHOT:=$(date -u +%Y%m%dT%H%M%SZ)}"
+[[ "$SNAPSHOT" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || die "--snapshot: a UTC time such as 20261002T120000Z"
+command -v mmdebstrap >/dev/null || die "mmdebstrap not found (apt install mmdebstrap)"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
-# The vmtools commit this build is from, for the manifest. A build meant for
-# guests is made from a clean checkout at the commit vmtrust pins; a tree with
-# uncommitted changes to tracked files is recorded as such, never as the commit.
-git -C "$REPO" rev-parse --verify -q HEAD >/dev/null \
-    || die "$REPO is not a git checkout of vmtools; the manifest records its commit"
-SRC_COMMIT="$(git -C "$REPO" rev-parse HEAD)"
-[ -z "$(git -C "$REPO" status --porcelain --untracked-files=no)" ] || SRC_COMMIT="$SRC_COMMIT+changes"
-SHARE=/usr/share/initramfs-tools
-# 2026-09-28T00:00:00Z. Changing it changes the initrd, and so the measurement.
-export SOURCE_DATE_EPOCH=1790553600
-
-# The modules come from the host's /lib/modules, so they must be the same
-# build as the kernel package.
-kpkg="$(dpkg-query -W -f='${Version}' "linux-modules-$KVER" 2>/dev/null)" \
-    || die "linux-modules-$KVER is not installed"
+# The checkout is the operator's and this runs as root: git refuses another
+# user's repository unless told this one is expected.
+g() { git -c safe.directory="$REPO" -C "$REPO" "$@"; }
+g rev-parse --verify -q HEAD >/dev/null || die "$REPO is not a git checkout of vmtools"
+COMMIT="$(g rev-parse HEAD)"
+if [ -n "$(g status --porcelain --untracked-files=no)" ] && [ "$CHANGES" = 0 ]; then
+    die "$REPO has uncommitted changes to tracked files: commit them, or pass --allow-changes for a development build (never for guests)"
+fi
+# Whose the output is: the operator who ran sudo, not root.
+OWNER="${SUDO_UID:-0}:${SUDO_GID:-0}"
 
 mkdir -p "$OUT"
 OUT="$(realpath "$OUT")"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+ROOT="$WORK/root"
+B=/home/builder            # the build user's home inside the root
 
-# --- the agent, with no path of this machine in it ---
-# Rust embeds source paths (in panic messages, for one): the cargo registry's,
-# this checkout's and the target directory's. Each is mapped to a fixed name.
-# CARGO_ENCODED_RUSTFLAGS takes one flag per 0x1f-separated field, so a path
-# with a space in it cannot split a flag.
-CARGO_HOME_DIR="${CARGO_HOME:-$HOME/.cargo}"
-US=$'\x1f'
-# The checkout maps to /vmtrust, its name before vmtools was split out of
-# vmtrust: the name is compiled into the agent, so renaming it would change
-# every measurement for nothing.
-export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=$CARGO_HOME_DIR/registry/src=/cargo/registry/src${US}--remap-path-prefix=$REPO=/vmtrust${US}--remap-path-prefix=$WORK=/build"
-cargo build --quiet --release --locked --manifest-path "$REPO/attest/Cargo.toml" \
-    -p stage0-agent --target-dir "$WORK/target"
-unset CARGO_ENCODED_RUSTFLAGS
-AGENT="$WORK/target/release/stage0-agent"
-if grep -aqF -e "$HOME" -e "$REPO" -e "$WORK" "$AGENT"; then
-    die "the agent still contains a path of this machine"
-fi
-
-# --- the calculator: this checkout's port of sev-snp-measure ---
-# The same commit as the agent (source.commit), in a target directory of its
-# own so it cannot touch the agent's build. --no-default-features leaves out
-# its ID-block tool, which is never used here.
-cargo build --quiet --release --locked --manifest-path "$REPO/attest/Cargo.toml" \
-    -p sev-snp-measure --bin sev-snp-measure --no-default-features --target-dir "$WORK/calculator"
-MEASURE="$WORK/calculator/release/sev-snp-measure"
-# Recorded in the manifest as provenance only. The measurement is fixed by its
-# inputs, every one of which the manifest names, and the guest's signed report
-# checks it at every unlock; which program did the arithmetic does not change
-# that, so nothing checks this line.
-CALCULATOR="$("$MEASURE" --version)"
-[ -n "$CALCULATOR" ] || die "the calculator printed no version"
-
-# --- kernel, from the signed package ---
-( cd "$WORK" && apt-get download -q "linux-image-$KVER=$kpkg" >/dev/null )
-# Where the package sits in Ubuntu's archive, relative to any mirror, so a
-# guest owner can fetch the same file (the measurement guide).
-kdeb_path="$(apt-get download --print-uris "linux-image-$KVER=$kpkg" | sed -n "s|^'[^']*/ubuntu/\\(pool/[^']*\\)'.*|\\1|p")"
-[ -n "$kdeb_path" ] || die "no archive path for linux-image-$KVER=$kpkg"
-
-# The firmware: the manifest names Ubuntu's package and version for it when
-# --ovmf is byte-identical to that package's file, so a guest owner can fetch
-# it from Ubuntu's archive too.
-ovmf_lines=""
-sys_fw="/usr/share/ovmf/$(basename "$OVMF")"
-if [ -f "$sys_fw" ] && cmp -s "$OVMF" "$sys_fw"; then
-    fw_pkg="$(dpkg -S "$sys_fw" 2>/dev/null | cut -d: -f1)"
-    fw_ver="$(dpkg-query -W -f='${Version}' "$fw_pkg")"
-    ( cd "$WORK" && apt-get download -q "$fw_pkg=$fw_ver" >/dev/null )
-    fw_deb=("$WORK"/"$fw_pkg"_*.deb)
-    [ -f "${fw_deb[0]}" ] || die "apt-get download produced no $fw_pkg package"
-    fw_path="$(apt-get download --print-uris "$fw_pkg=$fw_ver" | sed -n "s|^'[^']*/ubuntu/\\(pool/[^']*\\)'.*|\\1|p")"
-    ovmf_lines="ovmf.package $fw_pkg $fw_ver
-ovmf.deb.path $fw_path
-ovmf.deb.sha256 $(sha256sum < "${fw_deb[0]}" | cut -d' ' -f1)"
-fi
-deb=("$WORK"/linux-image-"$KVER"_*.deb)
-[ -f "${deb[0]}" ] || die "apt-get download produced no linux-image-$KVER package"
-dpkg-deb --fsys-tarfile "${deb[0]}" | tar -x -C "$WORK" "./boot/vmlinuz-$KVER"
-install -m 0644 "$WORK/boot/vmlinuz-$KVER" "$OUT/vmlinuz"
-
-# --- a controlled copy of initramfs-tools ---
-S="$WORK/share"
-E="$WORK/empty"
-mkdir -p "$S/hooks" "$S/scripts" "$S/conf.d" "$S/conf-hooks.d" "$S/modules.d" "$E"
-cp -a "$SHARE/init" "$SHARE/hook-functions" "$SHARE/modules" "$SHARE/dhcpcd-hooks" "$S/"
-cp -a "$SHARE/scripts/functions" "$SHARE/scripts/local" "$SHARE/scripts/nfs" "$S/scripts/"
-for h in zz-busybox-initramfs klibc-utils kmod dhcpcd; do
-    cp -a "$SHARE/hooks/$h" "$S/hooks/"
-done
-# BUSYBOXDIR, which mkinitramfs requires when BUSYBOX=y.
-cp -a "$SHARE/conf-hooks.d/busybox-initramfs" "$S/conf-hooks.d/"
-cp -a /usr/sbin/mkinitramfs "$S/mkinitramfs"
-
-C="$WORK/conf"
-cp -a "$HERE/initramfs" "$C"
-mkdir -p "$C/conf.d"
-# Modes come from the checkout, and so from the umask of whoever made it
-# (Phase 2: 664 in one build, 644 in another). Set them.
-find "$C" -type d -exec chmod 0755 {} +
-find "$C" -type f -exec chmod 0644 {} +
-chmod 0755 "$C"/hooks/* "$C"/scripts/*/* "$C/wait-for-root"
-
-# rewrite <file> <from> <to>: literal, and the text must be there, so a
-# change in initramfs-tools stops the build instead of quietly letting the
-# host's files back in. None of the strings contains '|'.
-rewrite() {
-    grep -qF -- "$2" "$1" || die "rewrite: '$2' not found in ${1#"$WORK"/}"
-    sed -i "s|$(printf '%s' "$2" | sed 's/[.*^$[\\]/\\&/g')|$3|g" "$1"
+# Never delete the root while anything is still mounted inside it: /dev is
+# bound from the host. Unmount, check, and only then remove, on this file
+# system alone.
+cleanup() {
+    local m
+    for m in "$ROOT/dev" "$ROOT/proc"; do
+        mountpoint -q "$m" 2>/dev/null && { umount "$m" || umount -l "$m" || true; }
+    done
+    if findmnt -rn -o TARGET | grep -qF "$ROOT/"; then
+        echo "build.sh: something is still mounted under $ROOT; left in place, remove it by hand" >&2
+        return
+    fi
+    rm -rf --one-file-system "$WORK"
 }
-for f in "$S/mkinitramfs" "$S/hook-functions" "$S/hooks/zz-busybox-initramfs" \
-         "$S/hooks/kmod" "$S/hooks/dhcpcd" "$C/hooks/stage0"; do
-    rewrite "$f" /usr/share/initramfs-tools "$S"
-done
-# The host's modprobe configuration stays out: sources only, never the
-# destination paths inside the image.
-rewrite "$S/mkinitramfs" '/etc/modprobe.d/*.conf /lib/modprobe.d/*.conf' "$E/*.conf"
-rewrite "$S/hooks/kmod" 'echo /usr/lib/modprobe.d/*)" != "/usr/lib/modprobe.d/*"' "echo $E/*)\" != \"$E/*\""
-rewrite "$S/hooks/kmod" 'cp -aZ /usr/lib/modprobe.d/*' "cp -aZ $E/*"
-# mkinitramfs copies /etc/ld.so.conf* keeping the host's timestamps, and
-# SOURCE_DATE_EPOCH only clamps times newer than itself: an older directory
-# time on one host made two otherwise identical images differ (Phase 2).
-rewrite "$S/mkinitramfs" 'cp -pPr /etc/ld.so.conf* "$DESTDIR"/etc/' 'cp -PR /etc/ld.so.conf* "$DESTDIR"/etc/'
-if grep -qF /usr/share/initramfs-tools "$S/mkinitramfs" "$S/hook-functions" "$S"/hooks/* "$C/hooks/stage0"; then
-    die "a /usr/share/initramfs-tools path survived the rewrite"
+trap cleanup EXIT
+
+# --- the build root, from the snapshot ---
+# The package lists are kept (image.sh downloads the kernel with apt), and
+# so is the build user. The snapshot's signatures are checked with the build
+# host's Ubuntu keyring; the root carries its own from then on.
+U="https://snapshot.ubuntu.com/ubuntu/$SNAPSHOT"
+PKGS="initramfs-tools-core,3cpio,busybox-initramfs,klibc-utils,kmod,dhcpcd-base"
+PKGS="$PKGS,openssh-server,cryptsetup-bin,lvm2,util-linux,zstd,linux-modules-$KVER"
+PKGS="$PKGS,cargo,rustc,git,ca-certificates,ovmf-amdsev"
+echo "build.sh: making the build root from $U" >&2
+mmdebstrap --quiet --mode=root --variant=apt --include="$PKGS" \
+    --skip=cleanup/apt/lists \
+    --customize-hook='chroot "$1" useradd -m -U -s /bin/bash builder' \
+    resolute "$ROOT" \
+    "deb $U resolute main universe" \
+    "deb $U resolute-updates main universe" \
+    "deb $U resolute-security main universe" \
+    || die "mmdebstrap failed (above)"
+
+# A proxy with its own certificate authority, where the network needs one:
+# apt checks signatures and cargo checksums whatever the transport, so this
+# reaches no byte of the image.
+if [ -n "${SSL_CERT_FILE:-}" ] && [ -r "$SSL_CERT_FILE" ]; then
+    install -m 0644 "$SSL_CERT_FILE" "$ROOT/etc/ssl/certs/build-proxy-ca.crt"
+    echo 'Acquire::https::CAInfo "/etc/ssl/certs/build-proxy-ca.crt";' > "$ROOT/etc/apt/apt.conf.d/99build-proxy-ca"
+fi
+cp /etc/resolv.conf "$ROOT/etc/resolv.conf"
+mount -t proc proc "$ROOT/proc"
+mount --bind /dev "$ROOT/dev"
+
+# --- the firmware's package ---
+# image.sh names ovmf-amdsev's version in the manifest when --ovmf is that
+# package's file byte for byte. The root has the snapshot's newest; if the
+# pinned firmware is an older one the snapshot still lists, use that.
+install -m 0644 "$OVMF" "$ROOT$B/OVMF.amdsev.fd"
+if ! cmp -s "$OVMF" "$ROOT/usr/share/ovmf/OVMF.amdsev.fd"; then
+    for v in $(chroot "$ROOT" apt-cache madison ovmf-amdsev | awk '{print $3}'); do
+        chroot "$ROOT" env DEBIAN_FRONTEND=noninteractive apt-get install -y -q --allow-downgrades \
+            "ovmf-amdsev=$v" >/dev/null 2>&1 || continue
+        cmp -s "$OVMF" "$ROOT/usr/share/ovmf/OVMF.amdsev.fd" && break
+    done
+    cmp -s "$OVMF" "$ROOT/usr/share/ovmf/OVMF.amdsev.fd" \
+        || echo "build.sh: warning: --ovmf matches no ovmf-amdsev in the snapshot; the manifest will not name its package" >&2
 fi
 
-# As an ordinary user, cp -p skips ownership and mkinitramfs writes uid/gid 0
-# into the archive itself.
-export STAGE0_AGENT="$AGENT"
-sh "$S/mkinitramfs" -d "$C" -o "$OUT/initrd.img" "$KVER"
+# --- the source: this commit, and nothing else of this checkout ---
+g bundle create "$WORK/vmtools.bundle" HEAD 2>/dev/null
+install -m 0644 "$WORK/vmtools.bundle" "$ROOT$B/vmtools.bundle"
+[ "$CHANGES" = 0 ] || g diff --binary HEAD > "$ROOT$B/changes.patch"
+chroot --userspec=builder:builder "$ROOT" env -i HOME="$B" PATH=/usr/bin:/bin \
+    bash -c "set -e; cd $B && git -c advice.detachedHead=false clone -q vmtools.bundle vmtools \
+             && git -c advice.detachedHead=false -C vmtools checkout -q $COMMIT \
+             && if [ -s $B/changes.patch ]; then git -C vmtools apply $B/changes.patch; fi"
 
-# --- the manifest ---
-# One "key value" line each; the value is the rest of the line. Read it with
-# grep and cut, never by sourcing it.
-CMDLINE="$(cat "$HERE/cmdline")"
-sha() { sha256sum < "$1" | cut -d' ' -f1; }
-ver() { dpkg-query -W -f='${Version}' "$1"; }
-M="$OUT/manifest"
-{
-    echo "# stage 0 build manifest (stage0/build.sh). Values run to the end of the line."
-    echo "format 1"
-    echo "source.commit $SRC_COMMIT"
-    echo "kernel.file vmlinuz"
-    echo "kernel.sha256 $(sha "$OUT/vmlinuz")"
-    echo "kernel.package linux-image-$KVER $kpkg"
-    echo "kernel.deb.sha256 $(sha "${deb[0]}")"
-    echo "kernel.deb.path $kdeb_path"
-    echo "initrd.file initrd.img"
-    echo "initrd.sha256 $(sha "$OUT/initrd.img")"
-    echo "initramfs-tools.package initramfs-tools-core $(ver initramfs-tools-core)"
-    echo "cmdline $CMDLINE"
-    echo "ovmf.sha256 $(sha "$OVMF")"
-    [ -z "$ovmf_lines" ] || printf '%s\n' "$ovmf_lines"
-    echo "vcpu.type $VCPU_TYPE"
-    echo "guest.features $GUEST_FEATURES"
-    echo "vmm.type $VMM_TYPE"
-    for n in ${VCPUS//,/ }; do
-        m="$("$MEASURE" --mode snp --vcpus "$n" --vcpu-type "$VCPU_TYPE" \
-             --guest-features "$GUEST_FEATURES" --vmm-type "$VMM_TYPE" --ovmf "$OVMF" \
-             --kernel "$OUT/vmlinuz" --initrd "$OUT/initrd.img" --append "$CMDLINE")"
-        [[ "$m" =~ ^[0-9a-f]{96}$ ]] || die "sev-snp-measure gave no measurement for $n vCPUs"
-        echo "measurement.vcpus.$n $m"
-    done
-    echo "calculator $CALCULATOR"
-    echo "agent.sha256 $(sha "$AGENT")"
-    echo "agent.rustc $(rustc -V)"
-    echo "source-date-epoch $SOURCE_DATE_EPOCH"
-    # Every package that put a file in the image, at the version it was: the
-    # image is assembled from the build host's installed packages, so two
-    # hosts reproduce it only when these lines are identical.
-    # A file counts only if the image's copy is byte for byte the host's:
-    # busybox applet links, for one, share names with other packages' files.
-    X="$WORK/unpacked"
-    mkdir -p "$X"
-    unmkinitramfs "$OUT/initrd.img" "$X" >/dev/null
-    ( cd "$X" && find . -type f ) | sed 's|^\./||' | while read -r f; do
-        [ -f "/$f" ] && cmp -s "$X/$f" "/$f" || continue
-        # dpkg knows usr-merged files by either spelling.
-        dpkg -S "/$f" 2>/dev/null || dpkg -S "/${f#usr/}" 2>/dev/null || true
-    done | cut -d: -f1 | tr ',' '\n' | sed 's/^ *//' | sort -u | while read -r p; do
-        echo "package $p $(ver "$p")"
-    done
-} > "$M"
-cat "$M"
+# --- the image, built inside as the build user ---
+ENVS=(HOME="$B" PATH=/usr/bin:/bin USER=builder LOGNAME=builder STAGE0_SNAPSHOT="$SNAPSHOT")
+for v in http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY; do
+    [ -z "${!v:-}" ] || ENVS+=("$v=${!v}")
+done
+if [ -e "$ROOT/etc/ssl/certs/build-proxy-ca.crt" ]; then
+    ENVS+=(SSL_CERT_FILE=/etc/ssl/certs/build-proxy-ca.crt CARGO_HTTP_CAINFO=/etc/ssl/certs/build-proxy-ca.crt)
+fi
+chroot --userspec=builder:builder "$ROOT" env -i "${ENVS[@]}" \
+    bash "$B/vmtools/stage0/image.sh" --ovmf "$B/OVMF.amdsev.fd" --out "$B/out" \
+         --vcpus "$VCPUS" --kernel "$KVER" >/dev/null \
+    || die "image.sh failed in the build root (above)"
+
+for f in vmlinuz initrd.img manifest; do
+    install -m 0644 -o "${OWNER%:*}" -g "${OWNER#*:}" "$ROOT$B/out/$f" "$OUT/$f"
+done
+cat "$OUT/manifest"

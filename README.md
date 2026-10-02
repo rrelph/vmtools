@@ -11,7 +11,7 @@ confidential VMs:
 | `attest/sev-snp-measure` | A Rust port of [virtee/sev-snp-measure](https://github.com/virtee/sev-snp-measure) 0.0.13, which computes a VM's expected launch measurement from its firmware, kernel, initrd and command line. Owners can use it to reproduce the measurement the unlock tool checks; same command line as the original. Apache-2.0, like the original (its `README.md`). |
 | `attest/vmt-unzstd` | Decompresses a zstd file, checking every frame's checksum. Ubuntu compresses the contents of its `.deb` packages with zstd, which macOS's `tar` cannot read; this unpacks the kernel and firmware packages for the measurement. |
 | `attest/fuzz` | Fuzz targets for the report and codec parsers (its own lock; development only). |
-| `stage0/` | Builds stage 0 (`build.sh`: kernel, initrd, command line and a manifest with the expected measurements) and points a libvirt domain at a build (`install.sh`). |
+| `stage0/` | Builds stage 0 (`build.sh`, from Ubuntu's archive alone: kernel, initrd, command line and a manifest with the expected measurements; `image.sh` does the building inside its root) and points a libvirt domain at a build (`install.sh`). |
 
 ## Installing the unlock tool
 
@@ -102,10 +102,19 @@ with the stage 0 rebuild it causes. CI runs `cargo fmt --check`.
 
 ## Stage 0
 
-`stage0/build.sh` runs unprivileged on Ubuntu 26.04 and writes a manifest
-that names this repository's commit (`source.commit`), the kernel package and
-where it sits in Ubuntu's archive, the firmware, every package that put a
-file in the image, and the expected launch measurement per vCPU count.
+`stage0/build.sh` builds stage 0 from Ubuntu's archive alone. It makes a
+throwaway Ubuntu 26.04 root from the archive as it was at one moment
+(`snapshot.ubuntu.com`, `--snapshot`, default now) with mmdebstrap, and runs
+`stage0/image.sh` there as an unprivileged user: every file in the image,
+every tool that assembles and compresses it, and the compiler that builds
+the agent come from that root, never from the machine running the build. It
+needs root (for mmdebstrap and the chroot) and writes a manifest that names
+this repository's commit (`source.commit`), the snapshot
+(`build.snapshot`), the kernel package and where it sits in Ubuntu's
+archive, the firmware, every package that put a file in the image, the
+build tools' versions, and the expected launch measurement per vCPU count.
+The same commit, snapshot, kernel and firmware give the same bytes on any
+machine.
 `stage0/install.sh` sets a domain's kernel, initrd, command line, `host_data`
 and the server unlock key in fw_cfg from a build. The hosting operator's
 runbook (not in this repository) says when to rebuild and how to publish.
