@@ -38,6 +38,14 @@ export LC_ALL=C
 KVER=7.0.0-34-generic
 OUT="" OVMF="" VCPUS=4 SNAPSHOT="" CHANGES=0
 while [ $# -gt 0 ]; do
+    # Every option but --allow-changes takes a value. A pasted command that
+    # wrapped between an option and its value leaves the option last, or
+    # followed by another option: say so, not "unbound variable".
+    case "$1" in
+        --ovmf|--out|--vcpus|--kernel|--snapshot)
+            [ $# -ge 2 ] && [ -n "$2" ] && [ "${2#--}" = "$2" ] \
+                || die "$1 needs a value (if you pasted this command, check it was not split across lines)" ;;
+    esac
     case "$1" in
         --ovmf)          OVMF="$(realpath "$2")"; shift 2 ;;
         --out)           OUT="$2"; shift 2 ;;
