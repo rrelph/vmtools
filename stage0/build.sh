@@ -65,6 +65,12 @@ done
 : "${SNAPSHOT:=$(date -u +%Y%m%dT%H%M%SZ)}"
 [[ "$SNAPSHOT" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || die "--snapshot: a UTC time such as 20261002T120000Z"
 command -v mmdebstrap >/dev/null || die "mmdebstrap not found (apt install mmdebstrap)"
+# Nothing here reads the terminal, and nothing may: run from a terminal,
+# mmdebstrap's apt touched it from a background process group at its install
+# stage and the kernel stopped it (state T), silently and for good (Milan,
+# 2026-10-02). Input from /dev/null from here on; sudo has already asked for
+# its password.
+exec </dev/null
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
@@ -111,8 +117,10 @@ U="https://snapshot.ubuntu.com/ubuntu/$SNAPSHOT"
 PKGS="initramfs-tools-core,3cpio,busybox-initramfs,klibc-utils,kmod,dhcpcd-base"
 PKGS="$PKGS,openssh-server,cryptsetup-bin,lvm2,util-linux,zstd,linux-modules-$KVER"
 PKGS="$PKGS,cargo,rustc,git,ca-certificates,ovmf-amdsev"
-echo "build.sh: making the build root from $U" >&2
-mmdebstrap --quiet --mode=root --variant=apt --include="$PKGS" \
+echo "build.sh: making the build root from $U (a few minutes; mmdebstrap's progress follows)" >&2
+# setsid: no controlling terminal at all, so nothing mmdebstrap runs can be
+# stopped for touching one, even by opening /dev/tty itself.
+setsid -w mmdebstrap --mode=root --variant=apt --include="$PKGS" \
     --skip=cleanup/apt/lists \
     --customize-hook='chroot "$1" useradd -m -U -s /bin/bash builder' \
     resolute "$ROOT" \
@@ -164,6 +172,7 @@ done
 if [ -e "$ROOT/etc/ssl/certs/build-proxy-ca.crt" ]; then
     ENVS+=(SSL_CERT_FILE=/etc/ssl/certs/build-proxy-ca.crt CARGO_HTTP_CAINFO=/etc/ssl/certs/build-proxy-ca.crt)
 fi
+echo "build.sh: building the agent, the calculator and the initrd in the root" >&2
 chroot --userspec=builder:builder "$ROOT" env -i "${ENVS[@]}" \
     bash "$B/vmtools/stage0/image.sh" --ovmf "$B/OVMF.amdsev.fd" --out "$B/out" \
          --vcpus "$VCPUS" --kernel "$KVER" >/dev/null \
