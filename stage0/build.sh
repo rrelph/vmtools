@@ -71,7 +71,9 @@ fi
 # Whose the output is: the operator who ran sudo, not root.
 OWNER="${SUDO_UID:-0}:${SUDO_GID:-0}"
 
-mkdir -p "$OUT"
+# A new output directory is the operator's too, like the files in it: the
+# runbook retires old builds with a plain rm -r.
+[ -d "$OUT" ] || install -d -m 0755 -o "${OWNER%:*}" -g "${OWNER#*:}" "$OUT"
 OUT="$(realpath "$OUT")"
 WORK="$(mktemp -d)"
 ROOT="$WORK/root"
