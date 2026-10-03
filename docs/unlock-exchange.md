@@ -12,6 +12,115 @@ The design these implement, with its reasoning and open questions, is
 `design/attested-unlock-design.md` in the provider's repository; its section
 numbers (§7, check 8, …) are used here too.
 
+## In brief: the conversation
+
+The attestation and the unlock, as a dialogue between the owner's computer
+and the VM, leaving out the SSH handshake. The rest of this document is the
+detail behind each line.
+
+**Before it starts.** When the VM starts, stage 0 makes a brand-new Ed25519
+SSH host key, in memory. `stage0-agent` does not listen on anything: stage
+0's sshd listens on port 2222, and for each request the owner's computer
+makes over the SSH connection, sshd starts a fresh `stage0-agent`, hands it
+the request as text, and returns what it prints. When the owner's computer
+connects, its SSH layer records the host key the server actually presented:
+*the session's host key*, whose private half the far end of this connection
+holds.
+
+**Owner's computer (`vmt-unlock`):** makes a nonce, 32 random bytes from
+`/dev/urandom`, and sends it as text, 64 lowercase hex digits, as the SSH
+command:
+
+```
+attest 3f9c…(64 hex digits)…a1
+```
+
+**VM (`stage0-agent`):** checks that the request is exactly `attest` and 64
+hex digits, and decodes the nonce back to 32 bytes. Then:
+
+1. It takes its own SSH host key in OpenSSH wire form: the 51 bytes you get
+   by base64-decoding the middle field of its `.pub` line.
+2. It computes `REPORT_DATA = SHA-512(nonce || host key blob)`: 64 bytes,
+   exactly the size of the report's REPORT_DATA field.
+3. It asks the AMD firmware for a report through the kernel's configfs-tsm,
+   writing those 64 bytes, in binary, and asking for VMPL 0.
+4. The firmware returns the report: 1184 bytes (0x4A0), signed by the chip's
+   VCEK over bytes 0x000–0x29F.
+5. It checks, as a sanity check and not a security check, that the report
+   carries the REPORT_DATA it asked for, at VMPL 0.
+
+It replies with three lines of text:
+
+```
+stage0-attest 1
+host-key ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI…   (its host key, base64, as in a .pub file)
+report 0200000000000000…                          (the 1184-byte report, as 2368 hex digits)
+```
+
+No certificates come with it: the owner's computer gets those from AMD.
+
+**Owner's computer:** decodes the report from hex, and gets the VCEK, from
+its cache or from AMD's key distribution service, by the report's chip ID and
+firmware levels. Then it checks:
+
+- **signatures:** the VCEK chains to AMD's ASK and ARK, which are compiled
+  into the tool, and the report's ECDSA P-384 signature verifies under the
+  VCEK;
+- **REPORT_DATA, the binding:** it recomputes `SHA-512(nonce || host key
+  blob)` from its own nonce and **the session's host key**, not the
+  `host-key` line of the reply, which is only compared, for a warning;
+- **everything else:** the measurement (the stage 0 build the owner
+  accepts), the policy (debugging off, no migration agent, …), VMPL 0, the
+  firmware minimums, and HOST_DATA, against the owner's own copy of the
+  server unlock key.
+
+Only if all of that passes does it send a second request, over the same
+connection:
+
+```
+unlock
+```
+
+with the disk passphrase on that session's standard input, as raw bytes, no
+newline added, then end of input.
+
+**VM:** passes the bytes straight to `cryptsetup open`, never to a file,
+checks the opened system has modules for stage 0's kernel, and replies:
+
+```
+stage0-unlock 1
+unlocked /dev/vda3
+```
+
+Then stage 0 tears itself down and the VM's own system boots.
+
+**Two bindings, two jobs.** REPORT_DATA binds the report to *this
+connection, now*: a relaying host would have to present its own host key,
+and then the hash cannot match; an old report carries an old nonce. HOST_DATA
+binds the VM to *the owner's server unlock key*, the certificate authority
+stage 0's sshd trusts. The hypervisor sets HOST_DATA at launch
+(`SHA-256(unlock key blob)`, from the libvirt domain `install.sh` wrote), and
+the hypervisor is not trusted: but it cannot change HOST_DATA after launch,
+and the processor reports it, signed, in every report. So it may choose any
+value, but cannot hide its choice: a key other than the owner's fails check
+8 and nothing is sent, and stage 0 itself refuses to start sshd unless the
+key it is given in fw_cfg hashes to its own HOST_DATA. The passphrase's
+confidentiality rests on the measurement and REPORT_DATA; HOST_DATA decides
+who may connect to stage 0 at all.
+
+**What travels, and how:**
+
+| What | Direction | Encoding |
+|---|---|---|
+| The nonce | owner's computer → VM | hex text, in the SSH command (`attest <64 hex>`) |
+| Stage 0's host key | VM → owner's computer | base64, as in a `.pub` line (`host-key …`) |
+| The report | VM → owner's computer | hex text, 2368 digits (`report …`) |
+| The passphrase | owner's computer → VM | raw bytes, on standard input |
+
+Binary appears only as hash inputs and in the configfs-tsm files; the
+passphrase is the one thing sent as bare bytes. All of it travels inside the
+SSH connection, encrypted to the host key the report vouches for.
+
 ## Who is involved, and whom each trusts
 
 | Party | Runs | Trusted by the owner for |
