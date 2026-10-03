@@ -2,7 +2,9 @@
 //! `$XDG_CONFIG_HOME/vmt-unlock/<server>/config` (`~/.config/…` without it).
 //!
 //! One `key = value` per line; `#` starts a comment, to the end of the line;
-//! blank lines are ignored. Every key but `measurement` may appear once:
+//! blank lines (a trailing one from pressing Return before Control-D too),
+//! CRLF line endings and non-breaking spaces, which mail clients put in
+//! settings that are copied out of them, are all accepted. Every key but `measurement` may appear once:
 //!
 //!   host = 192.0.2.10          the VM's address (required)
 //!   port = 2222                stage 0's port (default 2222)
@@ -156,6 +158,26 @@ measurement = bb   # the next one, during a rollover
         assert_eq!(s.certificate.unwrap(), PathBuf::from("/c/vm/cert.pub"));
         assert!(s.identity.unwrap().ends_with(".ssh/id_ed25519_cvm"));
         assert_eq!(s.min_tcb.as_deref(), Some("4:0:28:222"));
+    }
+
+    #[test]
+    fn pasted_settings_are_tolerated() {
+        let f = Path::new("/c/vm/config");
+        let want = parse("vm", f, GOOD).unwrap();
+        // Blank lines, including a trailing one and one of only spaces.
+        let blank = format!("\n\n{GOOD}\n   \n\n");
+        assert_eq!(parse("vm", f, &blank).unwrap().measurements, want.measurements);
+        // CRLF line endings.
+        let crlf = GOOD.replace('\n', "\r\n");
+        let s = parse("vm", f, &crlf).unwrap();
+        assert_eq!((s.host.as_str(), s.min_tcb.as_deref()), ("192.0.2.10", Some("4:0:28:222")));
+        assert_eq!(s.measurements, want.measurements);
+        // Non-breaking spaces (U+00A0) indenting, around `=`, and trailing.
+        let nbsp = GOOD.replace(" = ", "\u{a0}=\u{a0}").replace('\n', "\u{a0}\n\u{a0}\u{a0}");
+        let s = parse("vm", f, &nbsp).unwrap();
+        assert_eq!(s.host, "192.0.2.10");
+        assert_eq!(s.min_tcb.as_deref(), Some("4:0:28:222"));
+        assert_eq!(s.measurements, want.measurements);
     }
 
     #[test]

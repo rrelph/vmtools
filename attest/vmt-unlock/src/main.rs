@@ -3,6 +3,7 @@
 //! and 8).
 
 mod config;
+mod expiry;
 mod explain;
 mod kds;
 mod ssh;
@@ -241,6 +242,13 @@ fn parse_args(args: Vec<String>) -> Result<Opts, Fail> {
     let ca_blob = one_key(&unlock_key)?;
     let host_data = snp::binding::host_data_for_ca(&ca_blob);
 
+    // An organization server's certificate ends on a date. Say so before it
+    // does, and refuse once it has, naming the date, rather than leave the
+    // reader a bare "permission denied" from the connection.
+    if let Some(c) = &certificate {
+        check_certificate_expiry(c)?;
+    }
+
     // A solo server: the owner's own SSH key is the server unlock key, and no
     // certificate is configured, so one is signed for this unlock through the
     // agent (ssh.rs). Only when the key really is the unlock key: anyone else
@@ -282,6 +290,33 @@ fn parse_args(args: Vec<String>) -> Result<Opts, Fail> {
         #[cfg(feature = "fault-injection")]
         inject_stale_nonce,
     })
+}
+
+/// Warn when the certificate in `f` ends within 30 days; refuse once it has
+/// ended. A file that cannot be read or is not a certificate is left to
+/// OpenSSH, which names what is wrong with it.
+fn check_certificate_expiry(f: &std::path::Path) -> Result<(), Fail> {
+    let Ok(text) = fs::read_to_string(f) else {
+        return Ok(());
+    };
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    match expiry::check(&text, now) {
+        expiry::Expiry::Fine => {}
+        expiry::Expiry::Soon { date, days } => eprintln!(
+            "vmt-unlock: warning: your certificate ({}) ends on {date}, in {days} day{}. \
+             Whoever holds the server unlock key must sign you a new one before then.",
+            f.display(),
+            if days == 1 { "" } else { "s" }
+        ),
+        expiry::Expiry::Over { date } => {
+            return Err(Fail::Usage(format!(
+                "your certificate ({}) ended on {date}, so the VM would refuse it. \
+                 Whoever holds the server unlock key must sign you a new one.",
+                f.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The one ssh-ed25519 public key in a file, as its wire blob.
