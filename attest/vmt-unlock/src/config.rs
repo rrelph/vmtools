@@ -2,7 +2,11 @@
 //! `$XDG_CONFIG_HOME/vmt-unlock/<server>/config` (`~/.config/…` without it).
 //!
 //! One `key = value` per line; `#` starts a comment, to the end of the line;
-//! blank lines are ignored. Every key but `measurement` may appear once:
+//! blank lines are ignored. The owner pastes these lines from an email, so
+//! what a mail client and a terminal paste do to them is taken as it comes:
+//! indentation or none, a blank last line (Return before Control-D), CRLF line
+//! endings, and non-breaking spaces where the email had spaces. Every key but
+//! `measurement` may appear once:
 //!
 //!   host = 192.0.2.10          the VM's address (required)
 //!   port = 2222                stage 0's port (default 2222)
@@ -156,6 +160,43 @@ measurement = bb   # the next one, during a rollover
         assert_eq!(s.certificate.unwrap(), PathBuf::from("/c/vm/cert.pub"));
         assert!(s.identity.unwrap().ends_with(".ssh/id_ed25519_cvm"));
         assert_eq!(s.min_tcb.as_deref(), Some("4:0:28:222"));
+    }
+
+    /// As the settings arrive from a paste: the owner drags from the `h` of
+    /// `host` to the end of the last line, so the first line has lost its
+    /// indentation and the rest keep theirs, then presses Return.
+    const PASTED: &str = "host = 192.0.2.10
+    identity = ~/.ssh/id_ed25519_cvm
+    unlock-key = unlock-key.pub
+    certificate = cert.pub
+    min-tcb = 4:0:28:222
+    measurement = aa   # unlock system 7.0.0-34-20260930-2, 4 vCPUs
+";
+
+    fn same(a: &Server, b: &Server) {
+        assert_eq!(
+            (&a.host, &a.identity, &a.unlock_key, &a.certificate, &a.min_tcb, &a.measurements),
+            (&b.host, &b.identity, &b.unlock_key, &b.certificate, &b.min_tcb, &b.measurements)
+        );
+    }
+
+    #[test]
+    fn pasted_settings_are_taken_as_they_come() {
+        let f = Path::new("/c/vm/config");
+        let want = parse("vm", f, PASTED).unwrap();
+        assert_eq!(want.host, "192.0.2.10");
+        assert_eq!(want.unlock_key.as_deref(), Some(Path::new("/c/vm/unlock-key.pub")));
+        assert_eq!(want.measurements, ["aa"]);
+        // Blank lines around and among them, one of spaces only.
+        same(&parse("vm", f, &format!("\n{PASTED}\n   \n\n")).unwrap(), &want);
+        // Every line indented, as when the selection starts at the margin.
+        let indented: String = PASTED.lines().map(|l| format!("    {}\n", l.trim())).collect();
+        same(&parse("vm", f, &indented).unwrap(), &want);
+        // CRLF line endings, and a last line with no line ending at all.
+        same(&parse("vm", f, &PASTED.replace('\n', "\r\n")).unwrap(), &want);
+        same(&parse("vm", f, PASTED.trim_end()).unwrap(), &want);
+        // Non-breaking spaces (U+00A0) wherever the email had spaces.
+        same(&parse("vm", f, &PASTED.replace(' ', "\u{a0}")).unwrap(), &want);
     }
 
     #[test]
