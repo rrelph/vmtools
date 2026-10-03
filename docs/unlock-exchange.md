@@ -162,6 +162,25 @@ ssh-keygen -q -U -s solo.pub -I "vmt-unlock solo <unix time>" -n unlock -O clear
 skew) for five minutes, for the one principal stage 0 accepts, with no
 extensions; gone with the session's folder.
 
+**The certificate is checked before anything connects**
+(`attest/vmt-unlock/src/cert.rs`). The one this unlock will present (the
+configured `certificate`, or, with none configured, ssh's own default
+`<identity>-cert.pub` if it exists; never a solo server's, which is made for
+this unlock) is read and judged as stage 0's sshd would judge it, so a
+certificate the VM would refuse is named here, with what is wrong, instead
+of surfacing as ssh's `Permission denied (publickey)`. It is refused (exit
+2) if it is a host certificate, does not name the principal `unlock`, was
+signed with a key other than the config's `unlock-key`, certifies a
+different key from `identity`'s `.pub`, or has ended (its valid-before time
+at or before this computer's clock); a configured certificate that does not
+exist is refused too. Within 30 days of its end, every unlock prints a
+`WARNING:` line with the end date, in this computer's time zone, as
+`ssh-keygen -L` shows it. A file that is not an Ed25519 certificate this
+reads is left to OpenSSH. Only the certificate's fields are read here; its
+signature is sshd's to verify. The clock that finally decides is the VM's:
+a computer whose clock is far off can refuse a certificate the VM would
+still take, and the message gives today's date so that shows.
+
 **The passphrase source** is decided now but read later: from `--key-file`
 (read first, byte for byte, so a wrong path fails before anything
 connects), standard input (`--key-file -`), `$VMT_UNLOCK_PASSPHRASE`, or a
@@ -434,7 +453,7 @@ The tool's exit status:
 |---|---|---|
 | 0 | unlocked | yes |
 | 1 | a check failed (or the report could not be read); evidence kept | no |
-| 2 | usage or configuration error | no |
+| 2 | usage or configuration error, including a certificate the VM would refuse | no |
 | 3 | connection or protocol error | no |
 | 4 | the VM did not unlock: it refused the passphrase, or could not start the system | yes, to the verified stage 0 |
 
