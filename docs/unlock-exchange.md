@@ -1,0 +1,476 @@
+# The unlock exchange, in full
+
+What passes between a VM's stage 0 and its owner's unlock tool, `vmt-unlock`,
+when the VM starts, and why each part is there. This describes the code in
+this repository: `stage0/` (the boot scripts and `install.sh`),
+`attest/stage0-agent` (the program stage 0 runs for each request),
+`attest/vmt-unlock` (the owner's tool) and `attest/snp` (the report, the
+binding and the checks, shared by both). Where this document and the code
+disagree, the code is what runs; please fix whichever is wrong.
+
+The design these implement, with its reasoning and open questions, is
+`design/attested-unlock-design.md` in the provider's repository; its section
+numbers (§7, check 8, …) are used here too.
+
+## Who is involved, and whom each trusts
+
+| Party | Runs | Trusted by the owner for |
+|---|---|---|
+| The owner's computer | `vmt-unlock`, OpenSSH's `ssh`, `ssh-keygen`, `ssh-add`, `curl` | everything: it holds the disk passphrase and the keys |
+| The host (the provider's server, and the provider) | QEMU, libvirt, OVMF, the network path | **nothing**. It can stop the VM or refuse to start it, and that is all it should be able to do |
+| The VM's processor (AMD SEV-SNP firmware) | the guest's memory encryption; signs reports | the report's contents, through AMD's certificate chain |
+| AMD's key distribution service (KDS) | serves the VCEK for a chip and TCB | nothing: what it serves must chain to the ARK and ASK pinned in the tool |
+| Stage 0, inside the VM | a measured kernel and initrd: sshd, `stage0-agent`, `cryptsetup` | only once the report proves it is the stage 0 the owner accepts |
+
+The exchange is built so that the passphrase reaches stage 0 only, and only a
+stage 0 whose identity, launch and SSH host key the processor has vouched for
+in this very session. Every other party sees ciphertext or nothing.
+
+## Before anything connects: what the launch fixes
+
+The host prepares the VM's definition with `stage0/install.sh --build <dir>
+--domain <name> --org-ca <unlock-key.pub>`, which sets:
+
+- **Measured direct boot.** The domain boots stage 0's kernel and initrd with
+  the manifest's command line (`<kernel>`, `<initrd>`, `<cmdline>`, and
+  `kernelHashes='yes'` on `<launchSecurity type='sev-snp'>`). OVMF hashes all
+  three into its own measured pages, so the launch **measurement** (the
+  report's `MEASUREMENT`) covers firmware, kernel, initrd and command line.
+  The command line is `root=/dev/mapper/ubuntu--vg-ubuntu--lv ro panic=-1
+  console=tty0 console=ttyS0,115200` (`stage0/cmdline`); `panic=-1` turns
+  every stage 0 panic into the end of the VM. The manifest gives one
+  measurement per vCPU count; `install.sh` prints the one for the domain's.
+- **`host_data` = SHA-256 of the server unlock key's wire blob.** The key is
+  one `ssh-ed25519` line. Its blob is the base64 field decoded (the OpenSSH
+  wire form: string `"ssh-ed25519"`, then the 32-byte key; 51 bytes), so a
+  comment or whitespace cannot change it. The host sets this 32-byte value at
+  launch (`<hostData>`, base64); the processor reports it at offset `0xC0` of
+  every report and the host cannot change it afterwards.
+  `snp::binding::host_data_for_ca` is the one definition, used by stage 0 and
+  by the tool.
+- **The unlock key itself, in fw_cfg**, as the entry
+  `opt/org.vmtrust/org-ca.pub` (the line `ssh-ed25519 <base64>`). The names
+  `org-ca` and `org.vmtrust` predate the term "server unlock key"; they are
+  part of what is measured and deployed, so they stay.
+
+The guest policy (debug off, migration agent off, and so on) is fixed at
+launch by the host's domain definition, not by `install.sh`; the owner checks
+it in the report (check 6).
+
+A **solo server**'s unlock key is its owner's own SSH key. An **organization
+server** has a separate unlock key, and each person who may unlock holds a
+certificate signed with it. Stage 0 cannot tell the two apart and does not
+need to: it trusts one key as a certificate authority, and a key may sign its
+own certificate.
+
+## Stage 0 boots
+
+In order, from `stage0/initramfs/scripts/init-premount/stage0` (before the
+root device is looked for):
+
+1. **SysRq off** (`/proc/sys/kernel/sysrq` = 0). The host controls the
+   keyboard and the serial console; stage 0 reads neither, and this removes
+   the one thing that would still act on a keypress.
+2. **configfs mounted** if it is not, and `/sys/kernel/config/tsm/report`
+   must exist (no configfs-tsm: not an SEV-SNP guest; panic).
+3. **The unlock key from fw_cfg**, copied to `/run/stage0/org-ca.pub` (a
+   tmpfs, mode 0700 directory), then **checked against `host_data`**:
+   `stage0-agent --check-host-data /run/stage0/org-ca.pub` requires exactly
+   one `ssh-ed25519` line, asks the processor for a report (REPORT_DATA all
+   zeroes: only `host_data` is read, and the report is fresh, so it is this
+   launch's), requires VMPL 0, and compares `host_data` with SHA-256 of the
+   key's blob. On any mismatch it panics, sshd never starts, and `panic=-1`
+   ends the VM. This argument form is reachable only from the boot script:
+   sshd runs the agent with no arguments (below).
+4. **DHCP** (`IP=dhcp configure_networking`; not `ip=` on the command line,
+   which would configure the network a second time after root is mounted).
+5. **A fresh Ed25519 host key**, `/run/stage0/host_ed25519`, made by
+   `ssh-keygen` now. It exists only in this boot's memory, which SEV-SNP
+   encrypts; never on disk, never in the image. Its fingerprint goes to the
+   console.
+6. **sshd**, on port 2222, with this configuration and nothing else:
+
+   ```
+   Port 2222
+   HostKey /run/stage0/host_ed25519
+   PidFile none
+   TrustedUserCAKeys /run/stage0/org-ca.pub
+   AuthorizedPrincipalsFile /etc/stage0/principals     # one line: unlock
+   AuthorizedKeysFile none
+   AllowUsers root
+   PermitRootLogin prohibit-password
+   PubkeyAuthentication yes
+   PasswordAuthentication no
+   KbdInteractiveAuthentication no
+   UsePAM no
+   PermitTTY no
+   PermitUserRC no
+   PermitUserEnvironment no
+   DisableForwarding yes
+   PermitTunnel no
+   LoginGraceTime 30
+   MaxAuthTries 3
+   ClientAliveInterval 15
+   ClientAliveCountMax 4
+   ForceCommand /usr/sbin/stage0-agent
+   ```
+
+   So the only way in is as `root`, with a **certificate** signed by the key
+   that `host_data` named, carrying the principal **`unlock`**; no plain
+   keys, no passwords, no terminal, no forwarding, and whatever command the
+   client asks for, sshd runs `stage0-agent`, which reads the request from
+   `SSH_ORIGINAL_COMMAND`.
+
+Then `scripts/local-top/stage0` waits, checking once a second, for
+`/run/stage0/unlocked`, however long that takes.
+
+The host cannot connect: it has no certificate from the unlock key, and it
+cannot make one. It cannot swap the unlock key for its own either: stage 0
+would refuse to start sshd (step 3), and the owner would see the wrong
+`host_data` anyway (check 8).
+
+## The owner's side, before connecting
+
+`vmt-unlock <server>` reads `~/.config/vmt-unlock/<server>/config`
+(`$XDG_CONFIG_HOME` respected; `attest/vmt-unlock/src/config.rs`), with
+command-line options overriding it. From it:
+
+- **The VM**: `host`, `port` (default 2222), `user` (default `root`), and
+  optionally `jump` (passed to `ssh -J`; nothing depends on the jump host,
+  whose traffic is the SSH connection's ciphertext).
+- **The owner's SSH key**, `identity`, and **certificate**, `certificate`.
+- **The unlock key's public half**, `unlock-key`: the **owner's own copy**,
+  never one from the provider. Its blob gives the `host_data` the report
+  must carry. This is what makes the unlock key self-checking: a key swapped
+  on its way to the provider at enrollment means the VM was started for the
+  swapped key, and check 8 fails at the first unlock, before any passphrase
+  is sent.
+- **`min-tcb`** (`bootloader:tee:snp:microcode`, decimal) and one or more
+  **`measurement`** lines (96 hex digits each; during a rollover, two).
+
+**A solo server's certificate** is made for this one unlock. When no
+certificate is configured and `identity`'s `.pub` is the unlock key itself,
+the tool first checks (`ssh-add -L`) that the SSH agent holds that key,
+refusing with the `ssh-add` command to run if not, then signs, through the
+agent, in the session's private folder:
+
+```
+ssh-keygen -q -U -s solo.pub -I "vmt-unlock solo <unix time>" -n unlock -O clear -V -1m:+5m solo.pub
+```
+
+`-U` keeps the private half in the agent. Valid from a minute ago (clock
+skew) for five minutes, for the one principal stage 0 accepts, with no
+extensions; gone with the session's folder.
+
+**The passphrase source** is decided now but read later: from `--key-file`
+(read first, byte for byte, so a wrong path fails before anything
+connects), standard input (`--key-file -`), `$VMT_UNLOCK_PASSPHRASE`, or a
+prompt (`Disk passphrase: `, echo off, on `/dev/tty`; the line ending is the
+Enter key and is not sent). Every source but a file is read only after every
+check has passed.
+
+## One SSH connection, and the host key it records
+
+Everything happens over **one** SSH connection: a ControlMaster, with each
+request a session multiplexed over it (`attest/vmt-unlock/src/ssh.rs`). A
+second, independent connection would not be bound to the report, and would
+reopen the relay attack below.
+
+The tool makes a private folder, `$XDG_RUNTIME_DIR/vmtu-<12 hex digits>` (or
+under the system's temporary folder), mode 0700, for the control socket, a
+private `known_hosts`, the master's log and any solo certificate. It is
+removed when the tool finishes, after `ssh -O exit`.
+
+Every `ssh` the tool runs carries:
+
+```
+-o BatchMode=yes
+-o ControlPath=<folder>/c
+-o UserKnownHostsFile=<folder>/known_hosts
+-o GlobalKnownHostsFile=/dev/null
+-o HostKeyAlgorithms=ssh-ed25519
+-o HashKnownHosts=no -o UpdateHostKeys=no -o CheckHostIP=no
+-o ConnectTimeout=20 -o ServerAliveInterval=10
+-o RequestTTY=no -o ForwardAgent=no -o ClearAllForwardings=yes
+-p <port>
+-i <identity> -o IdentitiesOnly=yes          (when there is an identity)
+-o CertificateFile=<certificate>              (configured, or the solo one)
+-J <jump>                                     (when there is one)
+```
+
+The user's own `~/.ssh/config` still applies where these do not override it
+(on a Mac, `UseKeychain` for the identity's passphrase, for instance).
+
+1. **The master** connects with `-o ControlMaster=yes -o
+   StrictHostKeyChecking=accept-new -N -f`: it accepts whatever host key
+   stage 0 presents, since the tool cannot know it in advance (it was made at
+   this boot), and records it in the private `known_hosts`. Authentication is
+   the certificate. If this fails, the master's own error is shown and the
+   tool stops (exit 3); nothing has been sent.
+2. **The recorded key** is read back: there must be exactly one entry for
+   this destination (`[host]:port`, or `host` on port 22), and it must be
+   Ed25519. None, several, or another type is refused. Its wire blob is
+   **the session's host key**: the key the client's SSH layer actually
+   authenticated the server with, and so the key whose private half the far
+   end of this connection holds. From here on, this blob is what the report
+   must be bound to; anything the guest *says* its host key is, is compared
+   only for a warning.
+3. **Each request** first asks the master whether it is still there (`ssh -O
+   check`); if not, the request fails (exit 3). It never reconnects, since a
+   new connection would be unbound. Then it runs as a session over the master:
+   `-o ControlMaster=no -o StrictHostKeyChecking=yes -T`, so even if the
+   multiplexer were somehow bypassed, a fresh connection would have to present
+   the recorded key, which only the attested stage 0 holds.
+
+## Request 1: `attest <nonce>`
+
+**The tool** makes a nonce of 32 bytes from `/dev/urandom` and runs, over the
+master:
+
+```
+ssh … root@<host> attest <64 lowercase hex digits>
+```
+
+**sshd** sets `SSH_ORIGINAL_COMMAND` to `attest <hex>` and runs
+`stage0-agent`. The agent splits it on ASCII whitespace and accepts exactly
+two words, `attest` and 64 hex digits (32 bytes); anything else is refused.
+
+**The agent**:
+
+1. Reads its own host key, `/run/stage0/host_ed25519.pub`, and takes its wire
+   blob.
+2. Computes **REPORT_DATA = SHA-512(nonce || host key blob)**: 64 bytes,
+   exactly the size of the report's REPORT_DATA field
+   (`snp::binding::report_data_for`, the same function the tool checks with).
+3. Asks the processor for a report through **configfs-tsm**: makes
+   `/sys/kernel/config/tsm/report/stage0-<pid>`, requires its `provider` to
+   be `sev_guest`, writes `0` to `privlevel` (VMPL 0) and the 64 bytes to
+   `inblob`, reads `generation`, reads `outblob` (the report), reads
+   `generation` again and refuses if it changed (another writer changed the
+   request in between). The directory is removed however the request ends.
+4. Parses the report as a guard, not a security check: if it is not for this
+   REPORT_DATA at VMPL 0, it refuses rather than return it.
+5. Replies on standard output, exactly three lines, and exits 0:
+
+   ```
+   stage0-attest 1
+   host-key ssh-ed25519 <base64 of its host key blob>
+   report <2368 hex digits: the 0x4A0-byte report>
+   ```
+
+   and logs `stage0-agent: attestation report served` on the console. No
+   certificates: the owner fetches those, from AMD.
+
+**The tool** requires exit status 0 and exactly those three lines, the first
+exactly `stage0-attest 1` (anything else: exit 3, "not in the stage 0
+format"). If the report does not parse (wrong length, unknown version), that
+is a failed verification, not a transport error: evidence is kept and the
+tool exits 1. If the `host-key` line is not the session's key, the tool says
+so as a `WARNING`; the check that decides is check 4, against the session's
+key, never against what the guest claims.
+
+## The VCEK, from AMD
+
+The report is signed with the **VCEK**, a key unique to the chip and its
+firmware levels. The tool looks it up by the report's `CHIP_ID` and
+`REPORTED_TCB` (using these before the report is verified is safe: a wrong
+VCEK fails to chain, or fails the signature):
+
+1. The cache, `$XDG_CACHE_HOME/vmt-unlock/vcek/` (or `~/.cache/…`, or
+   `--vcek-cache`), file `milan-<chip_id hex>-<bl>-<tee>-<snp>-<ucode>.der`.
+   Most unlocks need nothing more, and AMD learns nothing.
+2. Otherwise, unless `--offline`, AMD KDS:
+   `https://kdsintf.amd.com/vcek/v1/Milan/<chip_id hex>?blSPL=..&teeSPL=..&snpSPL=..&ucodeSPL=..`
+   with `curl -sSf --proto =https --max-time 30` (through `--kds-proxy`, e.g.
+   Tor's SOCKS port, if given). HTTPS is a convenience, not a check. The
+   VCEK enters the cache only if it chains to the pinned certificates.
+
+A zero `CHIP_ID` (policy MaskChipId) has no VCEK to fetch, and fails.
+
+## The checks
+
+`snp::verify::verify` runs all ten (the tenth only with `--chip-id`) and
+reports every result, so a failure says everything that is wrong at once.
+The verdict passes only if none fails. Report fields are read from these
+offsets (little-endian; `attest/snp/src/report.rs`):
+
+| Offset | Field | Used by |
+|---|---|---|
+| `0x000` | VERSION (2 to 5 accepted) | 3 |
+| `0x008` | POLICY | 6 |
+| `0x030` | VMPL | 7 |
+| `0x034` | SIGNATURE_ALGO | 3 |
+| `0x048` | KEY_INFO (SIGNING_KEY, MASK_CHIP_KEY) | 2 |
+| `0x050` | REPORT_DATA (64) | 4 |
+| `0x090` | MEASUREMENT (48) | 5 |
+| `0x0C0` | HOST_DATA (32) | 8 |
+| `0x180` | REPORTED_TCB | 1, 9 |
+| `0x1A0` | CHIP_ID (64) | 1, 10 |
+| `0x2A0` | SIGNATURE: r and s, 72 bytes each, little-endian | 2 |
+
+The signed bytes are `0x000` to `0x29F`.
+
+1. **Certificate chain, VCEK → ASK → ARK.** The ARK and ASK for Milan are
+   compiled into the tool (`attest/snp/pins/`) and checked against their
+   SHA-256 before use (`ARK_MILAN_SHA256`, `ASK_MILAN_SHA256` in
+   `certs.rs`), and the ARK's own signature and the ASK's by the ARK are
+   verified again. The VCEK must be signed by the ASK (RSASSA-PSS, SHA-384,
+   48-byte salt), be
+   for this report's `CHIP_ID` and `REPORTED_TCB`, and name a Milan product.
+   A zero `CHIP_ID` fails.
+2. **Signature.** SIGNING_KEY must be 0 (the VCEK), MASK_CHIP_KEY clear, the
+   signature field well formed (zeroes past the 48 bytes of r and of s, and in
+   the reserved rest), and ECDSA P-384 with SHA-384 over bytes `0x000`–`0x29F`
+   must verify under the VCEK.
+3. **Version and algorithm.** A version this verifier knows, and
+   SIGNATURE_ALGO 1 (ECDSA P-384 with SHA-384).
+4. **The binding.** REPORT_DATA must equal SHA-512(this nonce || **this
+   session's** host key blob). This is what ties the report to *this*
+   connection, now.
+5. **Measurement.** In the accepted set: the stage 0 build the owner accepts
+   (firmware, kernel, initrd, command line), for the VM's vCPU count.
+6. **Policy.** Debugging off, no migration agent, no CXL memory, reserved
+   bit 17 set, SMT only if allowed (`--no-smt` forbids it), no bit this
+   verifier does not know, and an ABI at or above `--min-abi`.
+7. **VMPL 0**: the report was requested at the most privileged level.
+8. **host_data** equals SHA-256 of the owner's own copy of the unlock key's
+   blob: the VM was started for the owner's key. (Stage 0 has already refused
+   to run with any other; this is the owner's own confirmation.)
+9. **TCB** at or above `min-tcb`, each of the four components.
+10. **CHIP_ID** in the allowlist, if `--chip-id` gave one; otherwise not run,
+    and neither shown nor counted.
+
+**If any check fails**, nothing is sent. The tool keeps the evidence, none of
+it secret, in `./vmt-unlock-evidence-<unix time>/` (or `--save`'s folder):
+`nonce.bin`, `report.bin`, `session-hostkey.pub`, `vcek.der` and
+`verdict.txt`. It prints `VERIFICATION FAILED. The disk passphrase was not
+sent.` and exits 1. The SSH connection closes; stage 0 keeps waiting.
+
+## Request 2: `unlock`, the passphrase on stdin
+
+**The tool** reads the passphrase now (unless a file already gave it) and
+runs, over the same master:
+
+```
+ssh … root@<host> unlock          (standard input: the passphrase bytes, then end of file)
+```
+
+The bytes are exactly the passphrase: no newline is added (a prompted one
+has its Enter removed; a `--key-file` is sent byte for byte, so a file
+ending in a newline sends one). The tool's copy is zeroed once the session
+ends. Inside SSH, the bytes are encrypted to the session whose host key the
+report has just vouched for.
+
+**The agent**, for `unlock` (exactly that one word):
+
+1. Takes an exclusive lock on `/run/stage0/unlock.lock` (one unlock at a
+   time), and refuses if `/run/stage0/unlocked` already exists.
+2. Reads standard input to end of file, at most 8192 bytes (more, or none,
+   is refused).
+3. Finds **the** LUKS volume: every device in `/sys/class/block` whose first
+   six bytes are `LUKS\xba\xbe`. Exactly one, or it refuses (stage 0 does not
+   guess).
+4. Opens it: `cryptsetup open --type luks --key-file=- <device>
+   stage0_crypt`, the passphrase on cryptsetup's standard input, which is
+   then closed. The key goes from the SSH channel to cryptsetup and is never
+   written to a file. The agent's buffer is then zeroed (volatile writes, so
+   the compiler cannot drop them).
+5. Checks the system it is about to start can run on stage 0's kernel, which
+   the guest keeps for its whole life (design §10.1): `lvm vgchange -a y
+   --sysinit`, waits up to 10 seconds for the command line's `root=` device,
+   mounts it read-only, and requires `/lib/modules/<this kernel's release>`.
+   If it is missing, it locks the disk again (`lvm vgchange -a n`,
+   `cryptsetup close`) and refuses, saying why; the VM keeps waiting.
+6. Replies, exits 0, and logs `<device> opened as stage0_crypt` on the
+   console:
+
+   ```
+   stage0-unlock 1
+   unlocked /dev/vda3
+   ```
+
+7. Writes `/run/stage0/unlocked` (`stage0_crypt <device>`; no secret), which
+   releases the boot. The reply is written first: teardown, which follows,
+   stops sshd.
+
+A wrong passphrase is cryptsetup's failure (`No key available with this
+passphrase.`), returned as an error; nothing changes, and stage 0 keeps
+waiting for another attempt.
+
+**The tool** reports success only if the session exited 0 and its output
+begins with `stage0-unlock 1`, newline, `unlocked `. It then prints
+`vmt-unlock: VM: unlocked <device>` and exits 0. Anything else is "the VM did
+not unlock", with stage 0's error text, exit 4.
+
+## After the unlock: teardown
+
+`local-top` sees the flag, activates LVM, and initramfs-tools mounts the root
+(`root=` from the measured command line). Then `init-bottom/stage0`, the
+last thing before `switch_root`:
+
+- renames `stage0_crypt` to the name the guest's `/etc/crypttab` gives that
+  volume (by its LUKS UUID), so the booted system recognizes it;
+- stops every stage 0 process (sshd, its session processes, the agent,
+  dhcpcd), waiting, then killing; any survivor is a panic;
+- flushes and downs every interface stage 0 configured, and removes its
+  network state: the booted system configures its own;
+- removes its configfs-tsm entries, unmounts configfs if it mounted it, and
+  removes `/run/stage0` (host key, sshd config, unlock key copy, flags), since
+  initramfs-tools carries `/run` into the booted system. Anything left is a
+  panic.
+
+The booted system has its own SSH host key, on the encrypted disk, which is
+what the owner's ordinary logins check.
+
+## Errors and exit status
+
+The agent writes `stage0: error: <reason>` on standard error, exits 1, and
+logs `stage0-agent: request refused: <reason>` on the console. It never puts
+a secret in either.
+
+The tool's exit status:
+
+| Status | Meaning | Passphrase sent? |
+|---|---|---|
+| 0 | unlocked | yes |
+| 1 | a check failed (or the report could not be read); evidence kept | no |
+| 2 | usage or configuration error | no |
+| 3 | connection or protocol error | no |
+| 4 | the VM did not unlock: it refused the passphrase, or could not start the system | yes, to the verified stage 0 |
+
+## Why it holds
+
+- **A relay.** The host could accept the owner's connection itself and pass
+  the requests to the real VM, hoping to read the passphrase in the middle.
+  To read it, the host must terminate SSH with a host key of its own, and
+  then the session's host key (recorded by the client) is not the key stage 0
+  bound into REPORT_DATA: check 4 fails. If the host instead forwards the
+  bytes untouched, it reads nothing.
+- **A replay.** An old report, even a genuine one from this VM, carries an
+  old nonce: check 4 fails. The nonce is fresh for every attempt.
+- **A different or modified guest.** Changed firmware, kernel, initrd or
+  command line changes the measurement (check 5); debugging or a migration
+  agent changes the policy (check 6); a guest that is not SEV-SNP has no
+  report AMD's chain will sign (checks 1–2).
+- **A substituted unlock key.** The host could launch the VM for a key of its
+  own, to make itself a certificate. Then `host_data` is that key's (check 8
+  fails for the owner), and if fw_cfg and `host_data` disagree, stage 0 never
+  starts sshd.
+- **Older firmware with known flaws**: check 9.
+- **A substituted root filesystem.** The host could swap the encrypted disk,
+  so that a genuine stage 0 opens a disk of the host's. That disk's LUKS
+  header does not accept the owner's passphrase, so the unlock fails (exit 4).
+  If the host somehow got a disk that did, the booted system would lack the
+  owner's own SSH host key, and the owner's next login would warn (design
+  §9.1).
+
+What it cannot do: keep the VM running. The host can always stop it, or
+refuse to start it. And the passphrase protects the disk only as well as its
+own strength and the owner's computer protect it.
+
+## Versions
+
+Both replies begin with a format version, `stage0-attest 1` and
+`stage0-unlock 1`; the tool accepts exactly `1`. A change to either reply's
+format changes that number, and the stage 0 agent's binary, and so the
+launch measurement of every stage 0 built from it.
