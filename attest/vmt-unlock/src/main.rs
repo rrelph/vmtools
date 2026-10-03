@@ -2,6 +2,7 @@
 //! then, release its disk key (design/attested-unlock-design.md, sections 7
 //! and 8).
 
+mod cert;
 mod config;
 mod explain;
 mod kds;
@@ -41,7 +42,8 @@ usage: vmt-unlock [options] <server>
       --certificate FILE your certificate from the server unlock key. With
                       none, when your key IS the server unlock key (a solo
                       server), one valid for five minutes is signed for this
-                      unlock through your SSH agent
+                      unlock through your SSH agent. Checked before anything
+                      connects; in its last 30 days, each unlock warns
       --unlock-key FILE the server unlock key, public half (required): the
                       VM must have been started for exactly this key
                       (--org-ca is the same option, by its old name)
@@ -96,6 +98,8 @@ struct Opts {
     chip_ids: Vec<[u8; 64]>,
     kds: kds::Kds,
     save: Option<PathBuf>,
+    /// A warning that the certificate ends soon, shown at every unlock.
+    cert_warning: Option<String>,
     #[cfg(feature = "fault-injection")]
     inject_stale_nonce: bool,
 }
@@ -252,6 +256,21 @@ fn parse_args(args: Vec<String>) -> Result<Opts, Fail> {
         }
         _ => false,
     };
+    // The certificate this unlock will present: the one configured, or ssh's
+    // own default beside the key, FILE-cert.pub, if there is one. A solo
+    // server's is made for each unlock and needs no check.
+    let presented = match (&certificate, &identity) {
+        _ if solo => None,
+        (Some(c), _) => Some(c.clone()),
+        (None, Some(id)) => {
+            Some(PathBuf::from(format!("{}-cert.pub", id.display()))).filter(|p| fs::metadata(p).is_ok())
+        }
+        (None, None) => None,
+    };
+    let cert_warning = match &presented {
+        Some(c) => check_certificate(c, identity.as_deref(), &unlock_key, &ca_blob, &where_)?,
+        None => None,
+    };
     let key = match key_file.as_deref() {
         Some("-") => KeySource::Stdin,
         Some(f) => KeySource::File(PathBuf::from(f)),
@@ -279,9 +298,80 @@ fn parse_args(args: Vec<String>) -> Result<Opts, Fail> {
         chip_ids,
         kds: kds::Kds { cache, proxy, offline },
         save,
+        cert_warning,
         #[cfg(feature = "fault-injection")]
         inject_stale_nonce,
     })
+}
+
+/// Before anything connects: refuse a certificate the VM would refuse, saying
+/// what is wrong with it, and return a warning when it ends within
+/// cert::WARN_DAYS. A file that is not a certificate this reads is left to
+/// OpenSSH, which says what is wrong with it.
+fn check_certificate(
+    c: &std::path::Path,
+    identity: Option<&std::path::Path>,
+    unlock_key: &std::path::Path,
+    ca_blob: &[u8],
+    where_: &str,
+) -> Result<Option<String>, Fail> {
+    let cd = c.display();
+    let text = match fs::read_to_string(c) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Fail::Usage(format!(
+                "your certificate {cd} does not exist{where_}. On a server with its own unlock key, \
+                 it is your SSH key's public half signed with that key."
+            )));
+        }
+        Err(e) => return Err(Fail::Usage(format!("{cd}: {e}"))),
+    };
+    let Some(cert) = cert::parse(&text) else {
+        return Ok(None);
+    };
+    let id_pub = identity.map(|i| PathBuf::from(format!("{}.pub", i.display())));
+    let id_blob =
+        id_pub.as_ref().and_then(|p| fs::read_to_string(p).ok()).and_then(|l| ed25519_blob_from_line(&l));
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let renew =
+        "Whoever holds the server unlock key makes a new one by signing your SSH key's public half again.";
+    match cert::judge(&cert, ca_blob, id_blob.as_deref(), now) {
+        Ok(None) => Ok(None),
+        Ok(Some(end)) => {
+            let n = cert::days_until(end, now);
+            Ok(Some(format!(
+                "your certificate {cd} ends on {}, in {n} day{}. {renew}",
+                cert::local_date(end),
+                if n == 1 { "" } else { "s" }
+            )))
+        }
+        Err(p) => {
+            let after =
+                if matches!(p, cert::Problem::Ended(_)) { format!(" {renew}") } else { String::new() };
+            let why = match p {
+                cert::Problem::Ended(end) => {
+                    format!("ended on {} (today is {})", cert::local_date(end), cert::local_date(now))
+                }
+                cert::Problem::OtherSigner => format!(
+                    "was signed with {}, not with this server's unlock key, {} ({})",
+                    cert::fingerprint_or_unknown(&cert.signed_by),
+                    fingerprint(ca_blob),
+                    unlock_key.display()
+                ),
+                cert::Problem::OtherKey => format!(
+                    "is for a different SSH key from yours ({})",
+                    id_pub.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
+                ),
+                cert::Problem::NoUnlock => format!(
+                    "does not name the principal \"{}\" (it names: {})",
+                    cert::PRINCIPAL,
+                    cert.principals.join(", ")
+                ),
+                cert::Problem::Host => "is a host certificate, not one for a person".to_string(),
+            };
+            Err(Fail::Usage(format!("your certificate {cd}{where_} {why}: the VM would refuse it.{after}")))
+        }
+    }
 }
 
 /// The one ssh-ed25519 public key in a file, as its wire blob.
@@ -369,6 +459,9 @@ fn run(o: Opts) -> Result<(), Fail> {
     }
     if t.solo.is_some() {
         ui.say("a solo server: signing this unlock's certificate with your key, through your SSH agent");
+    }
+    if let Some(w) = &o.cert_warning {
+        ui.say(&format!("WARNING: {w}"));
     }
     let via = t.jump.as_ref().map(|j| format!(" via {j}")).unwrap_or_default();
     ui.say(&format!("connecting to {}@{}:{}{via}", t.user, t.host, t.port));
