@@ -445,7 +445,8 @@ The signed bytes are `0x000` to `0x29F`.
    verified again. The VCEK must be signed by the ASK (RSASSA-PSS, SHA-384,
    48-byte salt), be
    for this report's `CHIP_ID` and `REPORTED_TCB`, and name a Milan product.
-   A zero `CHIP_ID` fails.
+   A zero `CHIP_ID` fails. (Milan's are the only ARK and ASK there are here:
+   see *Milan only, for now*.)
 2. **Signature.** SIGNING_KEY must be 0 (the VCEK), MASK_CHIP_KEY clear, the
    signature field well formed (zeroes past the 48 bytes of r and of s, and in
    the reserved rest), and ECDSA P-384 with SHA-384 over bytes `0x000`–`0x29F`
@@ -595,6 +596,43 @@ The tool's exit status:
 What it cannot do: keep the VM running. The host can always stop it, or
 refuse to start it. And the passphrase protects the disk only as well as its
 own strength and the owner's computer protect it.
+
+## Milan only, for now
+
+Everything here is for **AMD EPYC Milan**, the only processor generation in
+scope today. Each generation has its **own AMD root key (ARK) and signing
+key (ASK)**, so supporting Genoa, Turin, Venice or any later generation is
+not a matter of configuration: it needs that generation's ARK and ASK pinned
+and their fingerprints recorded, as Milan's were (fetched twice, from two
+places, and compared), and a way to choose the right chain for a report.
+**Revisit all of the following then:**
+
+- **The pinned chain:** `attest/snp/pins/ark-milan.der` and `ask-milan.der`,
+  their SHA-256 constants, and `AmdChain::milan()` (`attest/snp/src/certs.rs`),
+  which `vmt-unlock` uses unconditionally.
+- **The VCEK's product check:** check 1 requires a Milan VCEK
+  (`attest/snp/src/verify.rs`).
+- **AMD KDS:** the VCEK's address names the product (`/vcek/v1/Milan/…`),
+  and the cache's file names begin `milan-` (`attest/vmt-unlock/src/kds.rs`).
+- **The TCB layout:** `Tcb::from_u64` reads Milan's (and Genoa's) layout
+  (`attest/snp/src/report.rs`); later generations lay TCB_VERSION out
+  differently, which the TCB minimums (check 9), the VCEK lookup and the
+  VCEK match (check 1) all depend on.
+- **Report versions and fields:** the parser accepts versions 2 to 5; a new
+  generation may bring a newer version, or fields this verifier does not
+  read.
+- **The measurement:** it depends on the guest's vCPU type (the manifest's
+  measurements, computed with `VCPU_TYPE=EPYC-Milan` in `stage0/image.sh`,
+  and the measurement guide's `--vcpu-type=EPYC-Milan`), so a VM on another
+  generation has other measurements.
+- **`unlock-by-hand.sh`**, which is Milan only in the same ways.
+
+With more than one generation in service, the tool would also need to know
+which one a VM runs on, from the owner's configuration or from the chain the
+report verifies under, because the accepted measurements and the TCB
+minimums differ from one generation to the next. Choosing among several
+pinned chains is safe either way: a report that does not verify under the
+chain chosen fails check 1 or 2.
 
 ## Doing it with standard commands
 
