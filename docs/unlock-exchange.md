@@ -627,12 +627,18 @@ places, and compared), and a way to choose the right chain for a report.
   generation has other measurements.
 - **`unlock-by-hand.sh`**, which is Milan only in the same ways.
 
-With more than one generation in service, the tool would also need to know
-which one a VM runs on, from the owner's configuration or from the chain the
-report verifies under, because the accepted measurements and the TCB
-minimums differ from one generation to the next. Choosing among several
-pinned chains is safe either way: a report that does not verify under the
-chain chosen fails check 1 or 2.
+**The report says which generation it came from.** From report version 3,
+bytes `0x188`, `0x189` and `0x18A` are the CPUID family, model and stepping
+of the processor that made it; the Milan reports in `test/fixtures/snp/`
+(version 5) carry `0x19`, `0x01`, `0x01`: family 19h, model 01h. The VCEK
+says so too (its product-name extension, `Milan-B0` on those). So with
+several generations in service the tool can choose the chain from the
+report itself, before verifying it: the fields are inside the signed bytes,
+and a report that claims the wrong generation does not verify under the
+chain that claim selects (check 1 or 2 fails). What the report's generation
+cannot decide alone is which measurements and TCB minimums to accept: those
+differ by generation, and come from the owner's configuration, per
+generation.
 
 ## Doing it with standard commands
 
