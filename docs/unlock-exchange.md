@@ -596,6 +596,98 @@ What it cannot do: keep the VM running. The host can always stop it, or
 refuse to start it. And the passphrase protects the disk only as well as its
 own strength and the owner's computer protect it.
 
+## Doing it with standard commands
+
+Nothing in the owner's side needs vmt-unlock. Every step can be done with
+commands a Mac or a Linux machine already has, and `docs/unlock-by-hand.sh`
+does them, as a sketch (below). Even the single connection is no exception:
+vmt-unlock does no SSH of its own. It runs the stock `ssh` client and uses
+OpenSSH's ControlMaster, which anyone can use from a shell.
+
+| Step | With standard commands |
+|---|---|
+| Nonce | `openssl rand -hex 32` |
+| One connection | `ssh -M -S <socket> -o UserKnownHostsFile=<private file> -o StrictHostKeyChecking=accept-new -N -f -p 2222 root@<vm>` opens it; every later `ssh -S <socket> root@<vm> …` rides it. This is exactly what vmt-unlock runs |
+| The session's host key | read it from that private known_hosts file (not from the reply), and base64-decode it for the blob |
+| A solo server's certificate | `ssh-keygen -U -s …` through the agent: also exactly what vmt-unlock runs |
+| `attest` | `ssh -S <socket> root@<vm> attest $nonce`, and split the three reply lines with `sed` |
+| REPORT_DATA | SHA-512 of the nonce's bytes and the blob (`openssl dgst -sha512`, or `shasum -a 512`), compared with the 64 bytes at 0x50 of the report (`od`, or `xxd`) |
+| Measurement, HOST_DATA, VMPL, chip ID, TCB | fixed offsets in the report, read the same way and compared as hex |
+| Policy | one 64-bit field, its bits tested with shell arithmetic |
+| VCEK | `curl`, from AMD's KDS, by chip ID and TCB |
+| Certificate chain | `openssl verify` (the VCEK, through the ASK, to an ARK whose SHA-256 you check first) |
+| Sending the passphrase | `ssh -S <socket> root@<vm> unlock < file`, or read without echo and `printf '%s'` it in |
+
+**The fiddly parts**, none impossible, each easy to get subtly wrong:
+
+1. **The report's signature.** The report keeps ECDSA's r and s
+   little-endian, each in a 72-byte field; `openssl dgst -sha384 -verify`
+   wants them big-endian inside a DER structure. They have to be reversed,
+   stripped of their padding, given a leading zero where the top bit is set,
+   and wrapped in DER by hand. It is the step a hand-rolled version is most
+   likely to botch; a wrong-endian signature fails safe, but a sloppy script
+   might ignore the failure.
+2. **The VCEK's AMD extensions.** The VCEK must be for this chip and these
+   firmware levels, which sit in AMD-specific X.509 extensions:
+   `openssl asn1parse` shows them as raw bytes, to be picked out and compared
+   with the report.
+3. **RSA-PSS.** The ASK and the VCEK are signed with RSA-PSS. OpenSSL 3 on
+   Linux verifies the chain fine. macOS's `openssl` is LibreSSL, and whether
+   its chain verification handles RSA-PSS is unconfirmed: check that first on
+   a Mac.
+4. **Failing safe.** The passphrase must never be sent unless every check
+   passed. In a shell script, one unchecked exit status, or a comparison that
+   treats an empty string as a match, quietly breaks that.
+5. **The passphrase itself.** It must stay out of the command line and the
+   environment (both visible in `ps`), out of files and shell history, and
+   gain no newline: `cryptsetup` takes every byte.
+
+**What vmt-unlock adds**, then, is not a capability. The connection, the
+solo certificate and the VCEK download it delegates to `ssh`, `ssh-keygen`
+and `curl`. What it does itself is the verification, in Rust: the report's
+parsing, the ECDSA and RSA-PSS checks, the extensions, the binding, the same
+way every time, tested against real reports from Milan, with one exit path
+that sends nothing unless everything passed; and `--step`'s explanations,
+the evidence it keeps on a failure, and its VCEK cache.
+
+### `unlock-by-hand.sh`
+
+A bash script, written for bash 3.2 and later (a Mac's own) but run only on
+bash 5.2, that reads vmt-unlock's config and does the exchange with the commands above:
+
+```
+docs/unlock-by-hand.sh <config>                  attest, check, and only then unlock
+docs/unlock-by-hand.sh --verify <dir> <config>   check saved evidence, send nothing
+```
+
+It runs most of the checks: the pinned ARK and ASK, the chain, the VCEK's
+chip and TCB, the signature and signing key, the version, the binding, the
+measurement, debugging and the migration agent off, VMPL 0, host_data and
+the TCB minimums. It leaves out the policy's other bits and ABI, the VCEK's
+product name, a VCEK cache, `--step` and evidence. `UNLOCK_BY_HAND_VCEK`
+gives it a VCEK from a file instead of AMD (one vmt-unlock cached, say).
+**It is a sketch, to show the exchange needs no special software: use
+vmt-unlock to unlock a real VM.**
+
+What it was tested against, on Linux (OpenSSL 3.0.13, OpenSSH 9.6):
+
+- `--verify`, on the genuine reports in `test/fixtures/snp/`: the binding
+  report, with its nonce and stand-in host key, passes every check but
+  host_data (its host_data is zero); the host_data report passes host_data
+  and fails the binding (its REPORT_DATA is zero). One byte flipped inside
+  the signed area fails the signature; another nonce fails the binding; the
+  same chip's VCEK at another TCB fails the TCB match and the signature.
+- The live path, against a local sshd configured as stage 0's is
+  (certificate only, principal `unlock`, a forced command) with a stand-in
+  agent that answers `attest` with a genuine fixture report: the solo
+  certificate signed through the agent and accepted by sshd, one connection,
+  the session's host key recorded, the reply decoded, and every check run,
+  which then refused, rightly, since the report was not made for that
+  session; nothing reached the stand-in's `unlock`.
+
+Not tested: on a Mac; against a real stage 0; the `unlock` that follows a
+passing verification, which only a real stage 0 can give.
+
 ## Versions
 
 Both replies begin with a format version, `stage0-attest 1` and

@@ -11,7 +11,7 @@ confidential VMs:
 | `attest/sev-snp-measure` | A Rust port of [virtee/sev-snp-measure](https://github.com/virtee/sev-snp-measure) 0.0.13, which computes a VM's expected launch measurement from its firmware, kernel, initrd and command line. Owners can use it to reproduce the measurement the unlock tool checks; same command line as the original. Apache-2.0, like the original (its `README.md`). |
 | `attest/vmt-unzstd` | Decompresses a zstd file, checking every frame's checksum. Ubuntu compresses the contents of its `.deb` packages with zstd, which macOS's `tar` cannot read; this unpacks the kernel and firmware packages for the measurement. |
 | `attest/fuzz` | Fuzz targets for the report and codec parsers (its own lock; development only). |
-| `docs/unlock-exchange.md` | The unlock exchange between a VM's stage 0 and its owner's unlock tool, in full: what the launch fixes, how stage 0 starts, the one SSH connection, both requests and their replies byte for byte, every check, teardown, and why it holds. |
+| `docs/unlock-exchange.md` | The unlock exchange between a VM's stage 0 and its owner's unlock tool, in full: what the launch fixes, how stage 0 starts, the one SSH connection, both requests and their replies byte for byte, every check, teardown, and why it holds; and how to do it all with standard commands, with `docs/unlock-by-hand.sh`, a sketch that does. |
 | `stage0/` | Builds stage 0 (`build.sh`, from Ubuntu's archive alone: kernel, initrd, command line and a manifest with the expected measurements; `image.sh` does the building inside its root) and points a libvirt domain at a build (`install.sh`). |
 
 ## Installing the unlock tool
