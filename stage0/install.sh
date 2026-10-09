@@ -33,6 +33,14 @@
 # /usr/bin/qemu-system-x86_64), without the variable: rolling a guest back
 # to an older build puts it back on the QEMU that build was measured for.
 #
+# A guest's reboot must end its QEMU, so that what comes back is a fresh
+# launch: <on_reboot>destroy</on_reboot>, whatever the build. QEMU 10.2.1
+# cannot reset an SNP guest and stops anyway; QEMU master resets it in
+# place, and the launch measurement after that reset (on an EPYC Milan
+# host, 2026-10-09) matched none of the build's, so no owner's tool would
+# accept it. The stop is a guest shutdown to libvirt, which the host's
+# supervisor relaunches.
+#
 # Run as a user who can use virsh on the system connection, or set
 # VIRSH="sudo -n virsh". The change takes effect at the domain's next start;
 # a running domain is not touched (cvm finalize relies on this, Phase 4).
@@ -148,6 +156,8 @@ cmd_xml="$(printf '%s' "$CMDLINE" | esc)"
     || die "$DOMAIN: expected exactly one sev-snp <launchSecurity> line"
 [ "$(grep -c '^[[:space:]]*<emulator>[^<]*</emulator>[[:space:]]*$' "$xml")" = 1 ] \
     || die "$DOMAIN: expected exactly one <emulator> line"
+[ "$(grep -c '^[[:space:]]*<on_reboot>[a-z-]*</on_reboot>[[:space:]]*$' "$xml")" = 1 ] \
+    || die "$DOMAIN: expected exactly one <on_reboot> line"
 [ "$(grep -c '^<domain[ >]' "$xml")" = 1 ] || die "$DOMAIN: expected exactly one <domain> line"
 emu_xml="$(printf '%s' "$EMU" | esc)"
 QNS='http://libvirt.org/schemas/domain/qemu/1.0'
@@ -176,6 +186,7 @@ E="$emu_xml" D="$DS" N="$QNS" awk '
         print "    <qemu:env name=\047QEMU_SEV_DEBUG_SWAP\047 value=\0471\047/>"
         print "  </qemu:commandline>"
     }
+    /^[[:space:]]*<on_reboot>/ { sub(/<on_reboot>[a-z-]*</, "<on_reboot>destroy<") }
     /^[[:space:]]*<emulator>/ {
         i = index($0, ">"); j = index($0, "</emulator>")
         $0 = substr($0, 1, i) ENVIRON["E"] substr($0, j)
@@ -212,6 +223,7 @@ grep -qF "<hostData>$host_data_b64</hostData>" "$xml" || die "$DOMAIN's host_dat
 grep -qF "<entry name='opt/org.vmtrust/org-ca.pub'>$CA_LINE</entry>" "$xml" \
     || die "$DOMAIN's fw_cfg org CA is not the one given after define"
 grep -qF "<emulator>$emu_xml</emulator>" "$xml" || die "$DOMAIN's <emulator> is not $EMU after define"
+grep -q '<on_reboot>destroy</on_reboot>' "$xml" || die "$DOMAIN's <on_reboot> is not destroy after define"
 n="$(grep -c "<qemu:env name='QEMU_SEV_DEBUG_SWAP' value='1'/>" "$xml" || true)"
 [ "$n" = "$DS" ] || die "$DOMAIN has $n QEMU_SEV_DEBUG_SWAP settings after define; its build wants $DS"
 for part in kernel initrd; do

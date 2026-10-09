@@ -164,6 +164,11 @@ The host prepares the VM's definition with `stage0/install.sh --build <dir>
   that variable (`<qemu:env>`). A build without it gets the ordinary QEMU and
   no variable. The host could leave DebugSwap off, or set any other feature;
   either changes the measurement.
+- **A reboot is a new launch** (`<on_reboot>destroy</on_reboot>`): the
+  VM's reboot ends its QEMU, and the host starts it again from the
+  beginning, measured as above. A QEMU that resets an SNP guest in place
+  (QEMU master can) gave a measurement matching none of the build's, and the
+  owner's tool would refuse it.
 - **`host_data` = SHA-256 of the server unlock key's wire blob.** The key is
   one `ssh-ed25519` line. Its blob is the base64 field decoded (the OpenSSH
   wire form: string `"ssh-ed25519"`, then the 32-byte key; 51 bytes), so a
