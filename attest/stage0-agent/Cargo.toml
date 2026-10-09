@@ -9,3 +9,4 @@ publish.workspace = true
 
 [dependencies]
 snp = { path = "../snp", default-features = false }
+libc.workspace = true

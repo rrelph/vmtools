@@ -123,6 +123,14 @@ command line, `host_data` and the server unlock key in fw_cfg from a build,
 so a guest boots exactly what its build's measurement was computed from. The hosting operator's
 runbook (not in this repository) says when to rebuild and how to publish.
 
+Stage 0 does not stay: once the owner has unlocked the disk, it starts the
+VM's own kernel and initrd from that disk by kexec, handing the passphrase
+to the VM's initramfs (`docs/unlock-exchange.md`, *After the unlock*). kexec
+in an SNP guest needs the SEV feature DebugSwap, which the measurement
+covers (`guest.features 0x21` in the manifest) and QEMU sets. No QEMU release
+can set it yet, so `install.sh` runs such a build's guests on a QEMU built
+to set it (`--debug-swap-qemu`) and tells that QEMU to.
+
 ## Licence
 
 MIT OR Apache-2.0, at your option (`LICENSE-MIT`, `LICENSE-APACHE`), except

@@ -25,11 +25,10 @@ copy_exec /usr/bin/ssh-keygen
 copy_exec /usr/sbin/cryptsetup
 copy_exec /usr/sbin/dmsetup
 copy_exec /usr/sbin/lvm
-# initramfs-tools finds the root filesystem's type with blkid, which the stock
-# image gets from the udev hook; stage 0 has no udev.
-copy_exec /usr/sbin/blkid
+# The agent loads the guest's own kernel and starts it itself (kexec_file_load
+# and reboot), so stage 0 needs no kexec-tools. initramfs-tools never mounts a
+# root here, so neither blkid nor a wait-for-root is needed either.
 copy_exec "$STAGE0_AGENT" /usr/sbin/stage0-agent
-cp "$CONFDIR/wait-for-root" "$DESTDIR/usr/sbin/wait-for-root"
 
 mkdir -p "$DESTDIR/etc/stage0" "$DESTDIR/etc/lvm" "$DESTDIR/root"
 # The dhcpcd hook copies its user from the build host, whose uid differs from

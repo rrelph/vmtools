@@ -1,7 +1,9 @@
 #!/bin/sh
-# Stage 0 waits here, however long it takes, until the agent has opened the
-# volume for a guest owner who verified this guest. Then LVM, and the stock
-# local script mounts root.
+# Stage 0 waits here, however long it takes, until the agent has unlocked the
+# volume for a guest owner who verified this guest and loaded the guest's own
+# kernel for kexec (design section 10.2). Then it stops sshd and every
+# session, and starts that kernel. initramfs-tools never mounts a root or
+# reaches init-bottom: stage 0 ends here, one way or the other.
 
 PREREQ=""
 prereqs() { echo "$PREREQ"; }
@@ -11,10 +13,45 @@ esac
 
 . /scripts/functions
 
+S=/run/stage0
 log_begin_msg "stage0: waiting for the guest owner's attested unlock"
-while [ ! -e /run/stage0/unlocked ]; do
+while [ ! -e "$S/unlocked" ]; do
 	sleep 1
 done
 log_end_msg
 
-lvm vgchange -a y --sysinit || panic "stage0: LVM activation failed"
+log_begin_msg "stage0: teardown"
+# stage 0's processes: sshd, its sessions, the agent, and dhcpcd if it is
+# still around. The kexec ends them all anyway; stopping them first lets the
+# unlock session deliver its reply and close its connection cleanly.
+stage0_pids() {
+	for p in /proc/[0-9]*; do
+		case "$(readlink "$p/exe" 2>/dev/null)" in
+		/usr/sbin/sshd | /usr/lib/openssh/sshd-session | /usr/lib/openssh/sshd-auth | \
+			/usr/sbin/stage0-agent | /usr/sbin/dhcpcd)
+			echo "${p#/proc/}" ;;
+		esac
+	done
+}
+# The unlock session is finishing its reply; give it a moment, then stop all.
+i=0
+while [ -n "$(stage0_pids | grep -vx "$(cat "$S/sshd.pid")")" ] && [ $i -lt 10 ]; do
+	sleep 1
+	i=$((i + 1))
+done
+pids=$(stage0_pids)
+[ -n "$pids" ] && kill $pids
+i=0
+while [ -n "$(stage0_pids)" ] && [ $i -lt 5 ]; do
+	sleep 1
+	i=$((i + 1))
+done
+pids=$(stage0_pids)
+[ -n "$pids" ] && kill -9 $pids && sleep 1
+[ -z "$(stage0_pids)" ] || panic "stage0: sshd did not stop"
+log_end_msg
+
+# Only returns if the kernel could not be started. panic=-1 then ends the VM:
+# the loaded kernel and the key in its initrd go with it.
+/usr/sbin/stage0-agent --kexec
+panic "stage0: the guest's kernel did not start"

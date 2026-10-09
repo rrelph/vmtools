@@ -40,7 +40,8 @@ x509-cert = { version = "=0.2.5", default-features = false }
 # zstd decoding, pure Rust (vmt-unzstd only). `hash` brings twox-hash, to
 # check each frame's content checksum. No build.rs in either.
 ruzstd = { version = "=0.9.0", default-features = false, features = ["std", "hash"] }
-# The terminal, for the passphrase prompt (vmt-unlock only). Already in the
+# The terminal, for the passphrase prompt (vmt-unlock), and kexec_file_load,
+# memfd_create and reboot for the stage 0 agent's handoff. Already in the
 # graph, through sha2's cpufeatures; it has a build.rs.
 libc = { version = "=0.2.189", default-features = false }
 

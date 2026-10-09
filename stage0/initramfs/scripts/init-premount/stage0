@@ -42,7 +42,7 @@ dd if="$CA_FWCFG" of="$S/org-ca.pub" bs=4096 count=1 2>/dev/null || panic "stage
 # init configures the network a second time after mounting root.
 IP=dhcp configure_networking
 
-# Never on disk, never in the image: made here, removed in init-bottom.
+# Never on disk, never in the image: made here, gone with stage 0 at the kexec.
 ssh-keygen -q -t ed25519 -N '' -C stage0 -f "$S/host_ed25519" || panic "stage0: ssh-keygen failed"
 
 if [ ! -d /run/sshd ]; then

@@ -9,17 +9,26 @@
 //!                            the host public key and the report. No
 //!                            certificates: the guest owner fetches those.
 //!   unlock                   the disk key on stdin, straight into
-//!                            `cryptsetup open`; then checks that the root
-//!                            holds this kernel's modules (section 10.1),
-//!                            locking the disk again if not; prints the result.
+//!                            `cryptsetup open`; then loads the guest's own
+//!                            kernel and initrd from the unlocked root for
+//!                            kexec, the key in an archive in front of that
+//!                            initrd (section 10.2), and locks the disk again;
+//!                            prints the result. Any failure locks the disk
+//!                            again and leaves the VM waiting.
 //!
 //! It writes nothing that outlives it except, after a successful unlock, the
 //! flag that releases the boot (`UNLOCKED`), which holds no secret. The key is
 //! never written to a file: it goes from the SSH channel to cryptsetup's
-//! stdin. Stage 0's init-bottom script removes everything under `/run/stage0`.
+//! stdin, and into the memory-only initrd the kernel copies for kexec. Stage
+//! 0's local-top script then stops sshd and runs `stage0-agent --kexec`, which
+//! starts the loaded kernel; nothing of stage 0 survives that but the loaded
+//! kernel, initrd and command line.
 
+use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
@@ -36,11 +45,19 @@ const CRYPTSETUP: &str = "/usr/sbin/cryptsetup";
 const LVM: &str = "/usr/sbin/lvm";
 const MOUNT: &str = "/usr/bin/mount";
 const UMOUNT: &str = "/usr/bin/umount";
-/// Where the unlocked root is mounted, read-only, for the modules check.
-const ROOT_CHECK: &str = "/run/stage0/root-check";
-/// Stage 0 opens the volume under its own name; init-bottom renames it to
-/// the name the guest's /etc/crypttab expects, once that is readable.
+/// Where the unlocked root is mounted, read-only, while the guest's kernel,
+/// initrd and crypttab are read from it.
+const GUEST_ROOT: &str = "/run/stage0/root";
+/// Stage 0 opens the volume under its own name, and closes it again before
+/// the handoff: the guest's own initramfs opens it under its crypttab name.
 const MAPPER_NAME: &str = "stage0_crypt";
+/// The key file in the guest's initramfs, without the leading slash: the
+/// archive stage 0 puts in front of the guest's initrd holds it, and
+/// `cryptopts=...,key=/cryptroot/stage0.key` on the guest's command line
+/// points its cryptroot script there instead of its crypttab.
+const KEY_DIR: &str = "cryptroot";
+const KEY_FILE: &str = "cryptroot/stage0.key";
+const KEXEC_LOADED: &str = "/sys/kernel/kexec_loaded";
 const MAX_KEY: usize = 8192;
 /// Output format version, first line of every successful reply.
 const PROTOCOL: &str = "1";
@@ -49,16 +66,21 @@ type Result<T> = std::result::Result<T, String>;
 
 fn main() -> ExitCode {
     // Two ways in. sshd's ForceCommand runs the agent with no arguments, and
-    // the request comes in SSH_ORIGINAL_COMMAND. Stage 0's own boot script
-    // runs it with --check-host-data, before sshd exists; no SSH session can
-    // pass arguments, so that mode is not reachable from the network.
+    // the request comes in SSH_ORIGINAL_COMMAND. Stage 0's own boot scripts
+    // run it with --check-host-data, before sshd exists, and with --kexec,
+    // after sshd has stopped; no SSH session can pass arguments, so neither
+    // mode is reachable from the network.
     let args: Vec<String> = std::env::args().skip(1).collect();
     let r = if let [flag, ca] = &args[..]
         && flag == "--check-host-data"
     {
         check_host_data(Path::new(ca))
+    } else if let [flag] = &args[..]
+        && flag == "--kexec"
+    {
+        start_loaded_kernel()
     } else if !args.is_empty() {
-        Err("usage: stage0-agent [--check-host-data <org CA public key file>]".into())
+        Err("usage: stage0-agent [--check-host-data <org CA public key file> | --kexec]".into())
     } else {
         let cmd = std::env::var("SSH_ORIGINAL_COMMAND").unwrap_or_default();
         let words: Vec<&str> = cmd.split_ascii_whitespace().collect();
@@ -191,36 +213,54 @@ fn unlock() -> Result<()> {
 
     let mut key = Vec::with_capacity(MAX_KEY + 1);
     let n = io::stdin().take(MAX_KEY as u64 + 1).read_to_end(&mut key);
-    let r = match n {
+    let opened = match n {
         Err(e) => Err(format!("reading the key: {e}")),
         Ok(0) => Err("no key on stdin".into()),
         Ok(n) if n > MAX_KEY => Err(format!("the key is longer than {MAX_KEY} bytes")),
         Ok(_) => find_luks().and_then(|dev| open_luks(&dev, &key).map(|()| dev)),
     };
-    wipe(&mut key);
-    let dev = r?;
+    let dev = match opened {
+        Ok(dev) => dev,
+        Err(e) => {
+            wipe(&mut key);
+            return Err(e);
+        }
+    };
 
-    // The guest runs this kernel for its whole life (design section 10.1), so
-    // its root must carry this kernel's modules. Without them it would come up
-    // with no drivers; refuse now, with the reason, and keep waiting.
-    if let Err(e) = check_modules() {
-        let undo = close_luks();
-        return Err(match undo {
-            Ok(()) => format!("{e}. The disk has been locked again; this VM keeps waiting"),
-            Err(u) => format!("{e}. Locking the disk again failed too: {u}"),
-        });
+    // The key opened the volume. The guest boots its own kernel, from its own
+    // disk (design section 10.2): load it now, while the key is at hand for
+    // the guest's initramfs, which opens the volume again.
+    let loaded = load_guest(&dev, &key);
+    wipe(&mut key);
+    let closed = close_luks();
+    let kernel = match loaded {
+        Ok(k) => k,
+        Err(e) => {
+            return Err(match closed {
+                Ok(()) => format!("{e}. The disk has been locked again; this VM keeps waiting"),
+                Err(u) => format!("{e}. Locking the disk again failed too: {u}"),
+            });
+        }
+    };
+    // The kexec discards stage 0's mapping with the rest of its kernel, so a
+    // volume left open here does not stop the handoff. Say so on the console.
+    if let Err(e) = closed {
+        kmsg(&format!("closing {MAPPER_NAME} before the handoff failed: {e}"));
     }
 
-    // Reply first: the flag releases the boot, and teardown then stops sshd.
+    // Reply first: the flag releases the boot, and local-top then stops sshd.
     // A reply that cannot be written does not undo the unlock.
     let mut out = io::stdout().lock();
     let _ = write!(out, "stage0-unlock {PROTOCOL}\nunlocked {}\n", dev.display()).and_then(|_| out.flush());
-    kmsg(&format!("{} opened as {MAPPER_NAME}", dev.display()));
-    fs::write(UNLOCKED, format!("{MAPPER_NAME} {}\n", dev.display())).map_err(|e| format!("{UNLOCKED}: {e}"))
+    kmsg(&format!("{} unlocked; the guest's {kernel} is loaded to start", dev.display()));
+    fs::write(UNLOCKED, format!("{}\n", dev.display())).map_err(|e| {
+        unload_kernel();
+        format!("{UNLOCKED}: {e}")
+    })
 }
 
-/// Unmounts its directory however the check ends. A mount left behind would
-/// sit inside /run/stage0, which teardown removes.
+/// Unmounts its directory however the handoff's preparation ends. A mount
+/// left behind would keep the volume from closing.
 struct Mounted(&'static str);
 
 impl Drop for Mounted {
@@ -230,33 +270,39 @@ impl Drop for Mounted {
     }
 }
 
-fn run(prog: &str, args: &[&str]) -> Result<()> {
+fn run_output(prog: &str, args: &[&str]) -> Result<String> {
     let out = Command::new(prog)
         .args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
         .map_err(|e| format!("{prog}: {e}"))?;
     if out.status.success() {
-        Ok(())
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
         Err(format!("{prog}: {} ({})", String::from_utf8_lossy(&out.stderr).trim(), out.status))
     }
 }
 
-/// `/lib/modules/<this kernel>` on the unlocked root, read-only. The root is
-/// the command line's `root=`, which is measured.
-fn check_modules() -> Result<()> {
-    let release =
-        fs::read_to_string("/proc/sys/kernel/osrelease").map_err(|e| format!("kernel release: {e}"))?;
-    let release = release.trim();
+fn run(prog: &str, args: &[&str]) -> Result<()> {
+    run_output(prog, args).map(|_| ())
+}
+
+/// Loads the guest's own kernel for kexec: `/boot/vmlinuz` and
+/// `/boot/initrd.img` from the unlocked root, read-only, with this boot's
+/// command line and a `cryptopts=` naming the volume as the guest's
+/// /etc/crypttab does, and the key in an archive in front of the initrd.
+/// The root is the command line's `root=`, which is measured. Returns the
+/// kernel's file name, for the console.
+fn load_guest(dev: &Path, key: &[u8]) -> Result<String> {
+    let uuid = run_output(CRYPTSETUP, &["luksUUID", path_str(dev)?])?.trim().to_string();
     let cmdline = fs::read_to_string("/proc/cmdline").map_err(|e| format!("/proc/cmdline: {e}"))?;
     let root = cmdline
         .split_ascii_whitespace()
         .find_map(|w| w.strip_prefix("root="))
         .filter(|r| r.starts_with("/dev/"))
-        .ok_or("the kernel command line has no root=/dev/... to check")?;
+        .ok_or("the kernel command line has no root=/dev/... to mount")?;
 
     run(LVM, &["vgchange", "-a", "y", "--sysinit"])?;
     // No udev in stage 0: LVM makes the node itself, but not always at once.
@@ -268,26 +314,253 @@ fn check_modules() -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(200));
         tries += 1;
     }
-    fs::create_dir(ROOT_CHECK).map_err(|e| format!("{ROOT_CHECK}: {e}"))?;
-    run(MOUNT, &["-o", "ro", root, ROOT_CHECK]).inspect_err(|_| {
-        let _ = fs::remove_dir(ROOT_CHECK);
+    fs::create_dir(GUEST_ROOT).map_err(|e| format!("{GUEST_ROOT}: {e}"))?;
+    run(MOUNT, &["-o", "ro", root, GUEST_ROOT]).inspect_err(|_| {
+        let _ = fs::remove_dir(GUEST_ROOT);
     })?;
-    let mounted = Mounted(ROOT_CHECK);
-    let found = Path::new(mounted.0).join("lib/modules").join(release).is_dir();
-    drop(mounted);
-    if Path::new(ROOT_CHECK).exists() {
-        return Err(format!("{ROOT_CHECK} could not be unmounted"));
-    }
-    if !found {
-        kmsg(&format!("the unlocked root has no /lib/modules/{release}; not starting it"));
+    let mounted = Mounted(GUEST_ROOT);
+    let root_dir = Path::new(mounted.0);
+
+    let crypttab = fs::read_to_string(root_dir.join("etc/crypttab"))
+        .map_err(|e| format!("this VM's system has no readable /etc/crypttab: {e}"))?;
+    let entry = crypttab_entry(&crypttab, &uuid)?;
+    let boot_cmdline = stage1_cmdline(&cmdline, &entry, &uuid)?;
+    let (kernel_name, kernel) = boot_file(root_dir, "vmlinuz")?;
+    let (initrd_name, mut initrd) = boot_file(root_dir, "initrd.img")?;
+    // Ubuntu keeps the two links on one version; a pair that disagrees is a
+    // half-finished kernel update, and the kernel would start without its
+    // initramfs's modules.
+    let version = kernel_name.strip_prefix("vmlinuz-");
+    if version.is_none() || version != initrd_name.strip_prefix("initrd.img-") {
         return Err(format!(
-            "this VM's system has no modules for the unlock system's kernel {release} \
-             (/lib/modules/{release} is missing on its disk), so it would start without its drivers. \
-             Ask your provider to roll the unlock system back, unlock again, and let the VM install \
-             its kernel updates"
+            "this VM's /boot/vmlinuz is {kernel_name} but its /boot/initrd.img is {initrd_name}; \
+             they must be vmlinuz-<version> and initrd.img-<version>, the same version"
         ));
     }
+
+    let mut staged = memfd("stage0-initrd")?;
+    let mut archive = key_archive(key);
+    let assembled = staged
+        .write_all(&archive)
+        .and_then(|()| io::copy(&mut initrd, &mut staged).map(|_| ()))
+        .map_err(|e| format!("assembling the initrd: {e}"));
+    let loaded = assembled.and_then(|()| kexec_file_load(&kernel, &staged, &boot_cmdline));
+    // The kernel has its own copy now, or none. Zero the key in this one, and
+    // in the archive, before their memory goes back.
+    let _ = staged.write_all_at(&vec![0; archive.len()], 0);
+    wipe(&mut archive);
+    drop(staged);
+    // Closed before the unmount, which a file still open would make fail,
+    // and the volume could then not be locked again (2026-10-09).
+    drop(kernel);
+    drop(initrd);
+    loaded?;
+    drop(mounted);
+    Ok(kernel_name)
+}
+
+fn path_str(p: &Path) -> Result<&str> {
+    p.to_str().ok_or_else(|| format!("{} is not UTF-8", p.display()))
+}
+
+/// The guest's crypttab line for the volume with this LUKS UUID: its name
+/// and options. The booted system's systemd matches the open volume to its
+/// crypttab by name, so the guest's initramfs must open it under that name;
+/// any other and systemd would ask for the passphrase again.
+#[derive(Debug, PartialEq)]
+struct CryptEntry {
+    name: String,
+    options: String,
+}
+
+fn crypttab_entry(crypttab: &str, uuid: &str) -> Result<CryptEntry> {
+    let mut found = Vec::new();
+    for line in crypttab.lines() {
+        let fields: Vec<&str> = line.split_ascii_whitespace().collect();
+        let (name, source) = match fields[..] {
+            [first, ..] if first.starts_with('#') => continue,
+            [name, source, ..] => (name, source),
+            _ => continue,
+        };
+        let id = source.strip_prefix("UUID=").or_else(|| source.strip_prefix("/dev/disk/by-uuid/"));
+        if id.is_some_and(|id| id.eq_ignore_ascii_case(uuid)) {
+            found.push(CryptEntry {
+                name: name.to_string(),
+                options: fields.get(3).unwrap_or(&"").to_string(),
+            });
+        }
+    }
+    let entry = match found.len() {
+        1 => found.remove(0),
+        0 => return Err(format!("this VM's /etc/crypttab has no line for its disk (UUID={uuid})")),
+        _ => {
+            return Err(format!("this VM's /etc/crypttab has more than one line for its disk (UUID={uuid})"));
+        }
+    };
+    // Both go on the kernel command line, inside one comma-separated word.
+    let plain = |s: &str, extra: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b) || extra.as_bytes().contains(&b))
+    };
+    if !plain(&entry.name, "") {
+        return Err(format!(
+            "this VM's /etc/crypttab names its disk {:?}, which stage 0 cannot pass on",
+            entry.name
+        ));
+    }
+    if !entry.options.is_empty() && !plain(&entry.options, "=,:/") {
+        return Err(format!(
+            "this VM's /etc/crypttab has options {:?}, which stage 0 cannot pass on",
+            entry.options
+        ));
+    }
+    for opt in entry.options.split(',') {
+        let word = opt.split('=').next().unwrap_or("");
+        if ["keyscript", "plain", "tcrypt", "bitlk"].contains(&word) {
+            return Err(format!(
+                "this VM's /etc/crypttab has the option {opt:?} for its disk, which stage 0 cannot honor"
+            ));
+        }
+    }
+    Ok(entry)
+}
+
+/// The guest kernel's command line: this boot's, which is measured, less the
+/// `initrd=` the firmware adds for its own loader, plus the `cryptopts=`
+/// that has the guest's initramfs open the volume with the key stage 0
+/// passes, instead of asking.
+fn stage1_cmdline(cmdline: &str, entry: &CryptEntry, uuid: &str) -> Result<String> {
+    if !uuid.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') || uuid.is_empty() {
+        return Err(format!("the disk's LUKS UUID {uuid:?} is not a UUID"));
+    }
+    let mut words: Vec<&str> = Vec::new();
+    for w in cmdline.split_ascii_whitespace() {
+        if w.starts_with("cryptopts=") {
+            return Err("this boot's command line already has a cryptopts=".into());
+        }
+        if !w.starts_with("initrd=") {
+            words.push(w);
+        }
+    }
+    let mut options: Vec<&str> = entry.options.split(',').filter(|o| !o.is_empty()).collect();
+    if !options.contains(&"luks") {
+        options.push("luks");
+    }
+    let opts =
+        format!("cryptopts=target={},source=UUID={uuid},key=/{KEY_FILE},{}", entry.name, options.join(","));
+    words.push(&opts);
+    Ok(words.join(" "))
+}
+
+/// `/boot/<link>` on the guest's root: Ubuntu's link to the current kernel or
+/// initrd, which must point at a file beside it in /boot. Anything else
+/// (an absolute target would resolve in stage 0's own tree) is refused.
+fn boot_file(root: &Path, link: &str) -> Result<(String, File)> {
+    let boot = root.join("boot");
+    let target = fs::read_link(boot.join(link)).map_err(|e| format!("this VM's /boot/{link}: {e}"))?;
+    let name = target
+        .to_str()
+        .filter(|t| !t.is_empty() && !t.contains('/') && *t != "." && *t != "..")
+        .ok_or_else(|| {
+            format!("this VM's /boot/{link} points to {}, not to a file in /boot", target.display())
+        })?
+        .to_string();
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(boot.join(&name))
+        .map_err(|e| format!("this VM's /boot/{name}: {e}"))?;
+    let meta = file.metadata().map_err(|e| format!("this VM's /boot/{name}: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!("this VM's /boot/{name} is not a file"));
+    }
+    Ok((name, file))
+}
+
+/// A newc cpio archive holding the key, the format the kernel unpacks into
+/// the initramfs. It goes in front of the guest's initrd: the kernel unpacks
+/// concatenated archives in order, and the guest's does not touch the file.
+fn key_archive(key: &[u8]) -> Vec<u8> {
+    fn entry(out: &mut Vec<u8>, ino: u32, mode: u32, nlink: u32, name: &str, data: &[u8]) {
+        let fields = [ino, mode, 0, 0, nlink, 0, data.len() as u32, 0, 0, 0, 0, name.len() as u32 + 1, 0];
+        out.extend_from_slice(b"070701");
+        for f in fields {
+            out.extend_from_slice(format!("{f:08X}").as_bytes());
+        }
+        out.extend_from_slice(name.as_bytes());
+        out.push(0);
+        out.resize(out.len().next_multiple_of(4), 0);
+        out.extend_from_slice(data);
+        out.resize(out.len().next_multiple_of(4), 0);
+    }
+    let mut out = Vec::with_capacity(512 + key.len());
+    entry(&mut out, 1, 0o040700, 2, KEY_DIR, &[]);
+    entry(&mut out, 2, 0o100400, 1, KEY_FILE, key);
+    entry(&mut out, 0, 0, 1, "TRAILER!!!", &[]);
+    out
+}
+
+/// An anonymous file in memory: never in any file system.
+fn memfd(name: &str) -> Result<File> {
+    let c = CString::new(name).map_err(|_| "memfd name".to_string())?;
+    // SAFETY: c is a valid NUL-terminated string for the call's duration.
+    let fd = unsafe { libc::memfd_create(c.as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(format!("memfd_create: {}", io::Error::last_os_error()));
+    }
+    // SAFETY: fd is a new descriptor that nothing else owns.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// kexec_file_load(2): the kernel reads both files and checks the kernel's
+/// format itself; nothing runs until `--kexec`.
+fn kexec_file_load(kernel: &File, initrd: &File, cmdline: &str) -> Result<()> {
+    let c = CString::new(cmdline).map_err(|_| "the command line has a NUL".to_string())?;
+    let len = c.as_bytes_with_nul().len();
+    // SAFETY: the descriptors are open for the call, and c outlives it.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_kexec_file_load,
+            kernel.as_raw_fd() as libc::c_long,
+            initrd.as_raw_fd() as libc::c_long,
+            len as libc::c_ulong,
+            c.as_ptr(),
+            0 as libc::c_ulong,
+        )
+    };
+    if r != 0 {
+        return Err(format!("loading the guest's kernel (kexec_file_load): {}", io::Error::last_os_error()));
+    }
     Ok(())
+}
+
+/// Drops a loaded kernel, so a later unlock starts clean.
+fn unload_kernel() {
+    // SAFETY: no pointers are passed.
+    unsafe {
+        libc::syscall(
+            libc::SYS_kexec_file_load,
+            -1 as libc::c_long,
+            -1 as libc::c_long,
+            0 as libc::c_ulong,
+            std::ptr::null::<libc::c_char>(),
+            libc::KEXEC_FILE_UNLOAD as libc::c_ulong,
+        );
+    }
+}
+
+/// `--kexec`, from local-top once sshd has stopped: start the kernel `unlock`
+/// loaded. Returns only on failure.
+fn start_loaded_kernel() -> Result<()> {
+    let loaded = fs::read_to_string(KEXEC_LOADED).map_err(|e| format!("{KEXEC_LOADED}: {e}"))?;
+    if loaded.trim() != "1" {
+        return Err("no kernel is loaded".into());
+    }
+    kmsg("starting the guest's own kernel");
+    // SAFETY: no pointers; reboot(2) returns only if it failed.
+    unsafe { libc::reboot(libc::LINUX_REBOOT_CMD_KEXEC) };
+    Err(format!("starting the loaded kernel: {}", io::Error::last_os_error()))
 }
 
 /// Undo an unlock: deactivate LVM on the volume and close it.
@@ -345,5 +618,117 @@ fn open_luks(dev: &Path, key: &[u8]) -> Result<()> {
     } else {
         let msg = String::from_utf8_lossy(&out.stderr);
         Err(format!("cryptsetup: {} ({})", msg.trim(), out.status))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const UUID: &str = "0d9f8c2e-6b1a-4c3d-9e2f-1a2b3c4d5e6f";
+
+    fn entry(name: &str, options: &str) -> CryptEntry {
+        CryptEntry { name: name.into(), options: options.into() }
+    }
+
+    #[test]
+    fn crypttab_finds_the_disk_by_uuid() {
+        let tab = format!("# <target> <source> <key> <options>\ndm_crypt-0 UUID={UUID} none luks,discard\n");
+        assert_eq!(crypttab_entry(&tab, UUID).unwrap(), entry("dm_crypt-0", "luks,discard"));
+        let by_path = format!("root /dev/disk/by-uuid/{} none\n", UUID.to_uppercase());
+        assert_eq!(crypttab_entry(&by_path, UUID).unwrap(), entry("root", ""));
+    }
+
+    #[test]
+    fn crypttab_refuses_what_it_cannot_pass_on() {
+        let other = "dm_crypt-0 UUID=11111111-2222-3333-4444-555555555555 none luks\n";
+        assert!(crypttab_entry(other, UUID).unwrap_err().contains("no line"));
+        let twice = format!("a UUID={UUID} none luks\nb UUID={UUID} none luks\n");
+        assert!(crypttab_entry(&twice, UUID).unwrap_err().contains("more than one"));
+        let commented = format!("#a UUID={UUID} none luks\n");
+        assert!(crypttab_entry(&commented, UUID).is_err());
+        for bad in ["luks,keyscript=/bin/x", "plain", "luks,tries=3;reboot"] {
+            let tab = format!("a UUID={UUID} none {bad}\n");
+            assert!(crypttab_entry(&tab, UUID).is_err(), "{bad}");
+        }
+        let comma_name = format!("a,b UUID={UUID} none luks\n");
+        assert!(crypttab_entry(&comma_name, UUID).is_err());
+    }
+
+    #[test]
+    fn stage1_cmdline_is_this_boots_with_cryptopts() {
+        let cmdline =
+            "initrd=initrd root=/dev/mapper/ubuntu--vg-ubuntu--lv ro panic=-1 console=ttyS0,115200\n";
+        assert_eq!(
+            stage1_cmdline(cmdline, &entry("dm_crypt-0", "discard"), UUID).unwrap(),
+            format!(
+                "root=/dev/mapper/ubuntu--vg-ubuntu--lv ro panic=-1 console=ttyS0,115200 \
+                 cryptopts=target=dm_crypt-0,source=UUID={UUID},key=/cryptroot/stage0.key,discard,luks"
+            )
+        );
+        assert!(stage1_cmdline("root=/dev/x cryptopts=source=y", &entry("a", "luks"), UUID).is_err());
+        assert!(stage1_cmdline("root=/dev/x", &entry("a", "luks"), "not a uuid").is_err());
+    }
+
+    /// Reads a newc archive back: (name, mode, data) per entry, up to the
+    /// trailer, which must end the archive on a 4-byte boundary.
+    fn parse_newc(mut a: &[u8]) -> Vec<(String, u32, Vec<u8>)> {
+        let field = |h: &[u8], i: usize| {
+            u32::from_str_radix(std::str::from_utf8(&h[6 + 8 * i..14 + 8 * i]).unwrap(), 16).unwrap()
+        };
+        let mut out = Vec::new();
+        let total = a.len();
+        loop {
+            assert_eq!(&a[..6], b"070701");
+            let (mode, size, namesize) = (field(a, 1), field(a, 6) as usize, field(a, 11) as usize);
+            let name = std::str::from_utf8(&a[110..110 + namesize - 1]).unwrap().to_string();
+            assert_eq!(a[110 + namesize - 1], 0);
+            let data_at = (110 + namesize).next_multiple_of(4);
+            let data = a[data_at..data_at + size].to_vec();
+            a = &a[(data_at + size).next_multiple_of(4).min(a.len())..];
+            if name == "TRAILER!!!" {
+                assert!(a.is_empty(), "bytes after the trailer");
+                assert_eq!(total % 4, 0);
+                return out;
+            }
+            out.push((name, mode, data));
+        }
+    }
+
+    #[test]
+    fn key_archive_holds_the_key_and_nothing_else() {
+        for key in [&b"x"[..], b"correct horse battery staple", &[0xff; 8192]] {
+            let got = parse_newc(&key_archive(key));
+            assert_eq!(
+                got,
+                vec![
+                    ("cryptroot".to_string(), 0o040700, vec![]),
+                    ("cryptroot/stage0.key".to_string(), 0o100400, key.to_vec()),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn boot_links_must_stay_in_boot() {
+        let root = std::env::temp_dir().join(format!("stage0-agent-test-{}", std::process::id()));
+        let boot = root.join("boot");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&boot).unwrap();
+        fs::write(boot.join("vmlinuz-7.0.0-38-generic"), b"kernel").unwrap();
+        std::os::unix::fs::symlink("vmlinuz-7.0.0-38-generic", boot.join("vmlinuz")).unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", boot.join("initrd.img")).unwrap();
+        std::os::unix::fs::symlink("../etc", boot.join("config")).unwrap();
+        fs::write(boot.join("plain"), b"not a link").unwrap();
+
+        let (name, mut f) = boot_file(&root, "vmlinuz").unwrap();
+        let mut body = String::new();
+        f.read_to_string(&mut body).unwrap();
+        assert_eq!((name.as_str(), body.as_str()), ("vmlinuz-7.0.0-38-generic", "kernel"));
+        assert!(boot_file(&root, "initrd.img").unwrap_err().contains("not to a file in /boot"));
+        assert!(boot_file(&root, "config").is_err());
+        assert!(boot_file(&root, "plain").is_err());
+        assert!(boot_file(&root, "missing").is_err());
+        fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -3,6 +3,7 @@
 # its manifest describes it.
 #
 #   usage: install.sh --build <dir> --domain <name> --org-ca <ca.pub> [--pool images]
+#                     [--debug-swap-qemu <path>] [--qemu <path>]
 #
 # <dir> is build.sh's output. Checks vmlinuz, initrd.img and OVMF.amdsev.fd
 # against the manifest, uploads them to the pool as <name>-stage0-vmlinuz,
@@ -22,6 +23,16 @@
 # Stage 0 refuses to start sshd unless the two agree, and the owner's tool
 # checks host_data against its own copy of the key.
 #
+# The SEV features a guest launches with are a measured input too, and QEMU
+# sets them, so the domain's QEMU follows the manifest's guest.features.
+# Stage 0 starts the guest's own kernel by kexec, which needs DebugSwap
+# (0x20); no QEMU release can set it yet, so a build with it boots the
+# guest on --debug-swap-qemu, a QEMU built to set it when the environment
+# variable QEMU_SEV_DEBUG_SWAP is 1, which the domain then passes
+# (<qemu:env>). A build without it boots on --qemu (default
+# /usr/bin/qemu-system-x86_64), without the variable: rolling a guest back
+# to an older build puts it back on the QEMU that build was measured for.
+#
 # Run as a user who can use virsh on the system connection, or set
 # VIRSH="sudo -n virsh". The change takes effect at the domain's next start;
 # a running domain is not touched (cvm finalize relies on this, Phase 4).
@@ -30,18 +41,20 @@ set -euo pipefail
 
 die() { echo "install.sh: $*" >&2; exit 1; }
 
-BUILD="" DOMAIN="" POOL=images ORG_CA=""
+BUILD="" DOMAIN="" POOL=images ORG_CA="" DS_QEMU="" QEMU=/usr/bin/qemu-system-x86_64
 while [ $# -gt 0 ]; do
     case "$1" in
         --build)  BUILD="$2"; shift 2 ;;
         --domain) DOMAIN="$2"; shift 2 ;;
         --pool)   POOL="$2"; shift 2 ;;
         --org-ca) ORG_CA="$2"; shift 2 ;;
+        --debug-swap-qemu) DS_QEMU="$2"; shift 2 ;;
+        --qemu)   QEMU="$2"; shift 2 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
 [ -n "$BUILD" ] && [ -n "$DOMAIN" ] && [ -n "$ORG_CA" ] \
-    || die "usage: install.sh --build <dir> --domain <name> --org-ca <ca.pub> [--pool images]"
+    || die "usage: install.sh --build <dir> --domain <name> --org-ca <ca.pub> [--pool images] [--debug-swap-qemu <path>] [--qemu <path>]"
 M="$BUILD/manifest"
 [ -r "$M" ] || die "no manifest in $BUILD"
 read -ra V <<< "${VIRSH:-virsh}"
@@ -58,6 +71,18 @@ get() {
 CMDLINE="$(get cmdline)"
 grep -q '^ovmf\.file ' "$M" \
     || die "$BUILD predates builds that carry their firmware (its manifest has no ovmf.file): make a new build"
+features="$(get guest.features)"
+[[ "$features" =~ ^0x[0-9a-fA-F]+$ ]] || die "manifest: guest.features is not a hex number: $features"
+# Which QEMU, and whether it is told to set DebugSwap.
+if (( features & 0x20 )); then
+    DS=1
+    [ -n "$DS_QEMU" ] || die "$BUILD's guest features ($features) include DebugSwap: give --debug-swap-qemu"
+    EMU="$DS_QEMU"
+else
+    DS=0
+    EMU="$QEMU"
+fi
+[ -x "$EMU" ] || die "QEMU not found or not executable: $EMU"
 
 for part in kernel initrd ovmf; do
     f="$BUILD/$(get "$part.file")"
@@ -121,12 +146,40 @@ cmd_xml="$(printf '%s' "$CMDLINE" | esc)"
     || die "$DOMAIN: expected its <loader> element on one line, with its path"
 [ "$(grep -c "<launchSecurity type='sev-snp'" "$xml")" = 1 ] \
     || die "$DOMAIN: expected exactly one sev-snp <launchSecurity> line"
+[ "$(grep -c '^[[:space:]]*<emulator>[^<]*</emulator>[[:space:]]*$' "$xml")" = 1 ] \
+    || die "$DOMAIN: expected exactly one <emulator> line"
+[ "$(grep -c '^<domain[ >]' "$xml")" = 1 ] || die "$DOMAIN: expected exactly one <domain> line"
+emu_xml="$(printf '%s' "$EMU" | esc)"
+QNS='http://libvirt.org/schemas/domain/qemu/1.0'
 # Point the loader at the build's firmware, keeping its attributes. Drop any
 # kernel, initrd and cmdline, then put the manifest's in after the loader.
 # awk passes the values through ENVIRON, so nothing in them is code. The same
 # for any earlier hostData and fw_cfg block: put the new ones in, host_data
-# inside launchSecurity, the fw_cfg entry before <os>.
-L="${path[ovmf]}" K="${path[kernel]}" I="${path[initrd]}" C="$cmd_xml" H="$host_data_b64" F="$CA_LINE" awk '
+# inside launchSecurity, the fw_cfg entry before <os>. The same for the
+# emulator and the DebugSwap variable: drop the variable (and a
+# <qemu:commandline> it leaves empty), then put it back if the build has
+# DebugSwap, with the qemu namespace it needs on <domain>.
+L="${path[ovmf]}" K="${path[kernel]}" I="${path[initrd]}" C="$cmd_xml" H="$host_data_b64" F="$CA_LINE" \
+E="$emu_xml" D="$DS" N="$QNS" awk '
+    held != "" {
+        if (/^[[:space:]]*<qemu:env name=.QEMU_SEV_DEBUG_SWAP. /) next
+        if (/^[[:space:]]*<\/qemu:commandline>[[:space:]]*$/) { held = ""; next }
+        print held; held = ""
+    }
+    /^[[:space:]]*<qemu:env name=.QEMU_SEV_DEBUG_SWAP. / { next }
+    /^[[:space:]]*<qemu:commandline>[[:space:]]*$/ { held = $0; next }
+    /^<domain[ >]/ && ENVIRON["D"] == 1 && index($0, "xmlns:qemu=") == 0 {
+        sub(/>[[:space:]]*$/, " xmlns:qemu=\047" ENVIRON["N"] "\047>")
+    }
+    /^<\/domain>/ && ENVIRON["D"] == 1 {
+        print "  <qemu:commandline>"
+        print "    <qemu:env name=\047QEMU_SEV_DEBUG_SWAP\047 value=\0471\047/>"
+        print "  </qemu:commandline>"
+    }
+    /^[[:space:]]*<emulator>/ {
+        i = index($0, ">"); j = index($0, "</emulator>")
+        $0 = substr($0, 1, i) ENVIRON["E"] substr($0, j)
+    }
     /<loader/ {
         i = index($0, ">"); j = index($0, "</loader>")
         $0 = substr($0, 1, i) ENVIRON["L"] substr($0, j)
@@ -158,6 +211,9 @@ grep -q "kernelHashes='yes'" "$xml" || die "$DOMAIN has no kernelHashes='yes' af
 grep -qF "<hostData>$host_data_b64</hostData>" "$xml" || die "$DOMAIN's host_data is not the org CA's after define"
 grep -qF "<entry name='opt/org.vmtrust/org-ca.pub'>$CA_LINE</entry>" "$xml" \
     || die "$DOMAIN's fw_cfg org CA is not the one given after define"
+grep -qF "<emulator>$emu_xml</emulator>" "$xml" || die "$DOMAIN's <emulator> is not $EMU after define"
+n="$(grep -c "<qemu:env name='QEMU_SEV_DEBUG_SWAP' value='1'/>" "$xml" || true)"
+[ "$n" = "$DS" ] || die "$DOMAIN has $n QEMU_SEV_DEBUG_SWAP settings after define; its build wants $DS"
 for part in kernel initrd; do
     grep -qF "<$part>${path[$part]}</$part>" "$xml" || die "$DOMAIN's <$part> is not ${path[$part]} after define"
 done
@@ -166,4 +222,5 @@ done
 
 echo "$DOMAIN: stage 0 from $BUILD, $vcpus vCPUs"
 echo "host_data $host_data_hex (org CA $CA_LINE)"
+echo "qemu $EMU, guest features $features"
 echo "measurement $MEASUREMENT"

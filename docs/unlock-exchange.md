@@ -85,14 +85,18 @@ with the disk passphrase on that session's standard input, as raw bytes, no
 newline added, then end of input.
 
 **VM:** passes the bytes straight to `cryptsetup open`, never to a file,
-checks the opened system has modules for stage 0's kernel, and replies:
+loads the VM's own kernel and initrd from the opened disk to start by
+kexec, with the passphrase in memory for that initrd, locks the disk again,
+and replies:
 
 ```
 stage0-unlock 1
 unlocked /dev/vda3
 ```
 
-Then stage 0 tears itself down and the VM's own system boots.
+Then stage 0 stops sshd and starts the VM's own kernel, whose initramfs
+opens the disk with the passphrase stage 0 handed it, and the VM's own
+system boots.
 
 **Two bindings, two jobs.** REPORT_DATA binds the report to *this
 connection, now*: a relaying host would have to present its own host key,
@@ -151,6 +155,15 @@ The host prepares the VM's definition with `stage0/install.sh --build <dir>
   console=tty0 console=ttyS0,115200` (`stage0/cmdline`); `panic=-1` turns
   every stage 0 panic into the end of the VM. The manifest gives one
   measurement per vCPU count; `install.sh` prints the one for the domain's.
+- **SEV features `0x21`: SNPActive and DebugSwap.** They are in every vCPU's
+  initial state, so the measurement covers them, and stage 0's kexec needs
+  DebugSwap (see *After the unlock*). QEMU sets them, and no QEMU release can
+  set DebugSwap yet: for a build whose manifest has it, `install.sh` points
+  the domain at the QEMU given as `--debug-swap-qemu` (`<emulator>`), one
+  built to set it when its environment has `QEMU_SEV_DEBUG_SWAP=1`, and sets
+  that variable (`<qemu:env>`). A build without it gets the ordinary QEMU and
+  no variable. The host could leave DebugSwap off, or set any other feature;
+  either changes the measurement.
 - **`host_data` = SHA-256 of the server unlock key's wire blob.** The key is
   one `ssh-ed25519` line. Its blob is the base64 field decoded (the OpenSSH
   wire form: string `"ssh-ed25519"`, then the 32-byte key; 51 bytes), so a
@@ -506,23 +519,43 @@ report has just vouched for.
    then closed. The key goes from the SSH channel to cryptsetup and is never
    written to a file. The agent's buffer is then zeroed (volatile writes, so
    the compiler cannot drop them).
-5. Checks the system it is about to start can run on stage 0's kernel, which
-   the guest keeps for its whole life (design §10.1): `lvm vgchange -a y
+5. Loads the VM's own kernel to start (design §10.2): `lvm vgchange -a y
    --sysinit`, waits up to 10 seconds for the command line's `root=` device,
-   mounts it read-only, and requires `/lib/modules/<this kernel's release>`.
-   If it is missing, it locks the disk again (`lvm vgchange -a n`,
-   `cryptsetup close`) and refuses, saying why; the VM keeps waiting.
-6. Replies, exits 0, and logs `<device> opened as stage0_crypt` on the
-   console:
+   and mounts it read-only. From it:
+   - **the volume's crypttab line**: the one line of `/etc/crypttab` whose
+     source is `UUID=<the volume's LUKS UUID>` (or its `/dev/disk/by-uuid/`
+     path), for its name and options. None, or more than one, is refused, and
+     so is an option that would make the key file be ignored (`keyscript=`)
+     or the volume not be LUKS (`plain`, `tcrypt`, `bitlk`);
+   - **the kernel and initrd**: `/boot/vmlinuz` and `/boot/initrd.img`, which
+     must be links to files beside them in `/boot`, named for the same version
+     (`vmlinuz-<v>`, `initrd.img-<v>`), as Ubuntu keeps them.
+
+   It assembles the initrd in an anonymous memory file (`memfd_create`, in
+   no file system): a newc cpio archive holding `/cryptroot/stage0.key`
+   (mode 0400, the passphrase's bytes), then the VM's initrd unchanged. The
+   kernel unpacks the two in order, and the VM's archive never touches that
+   file. The command line is this boot's (`/proc/cmdline`, the measured one,
+   less any `initrd=` the firmware added), plus
+   `cryptopts=target=<name>,source=UUID=<uuid>,key=/cryptroot/stage0.key,<options>,luks`
+   (`luks` only if the options lack it): Ubuntu's cryptroot script then opens
+   the volume with that file under its crypttab name, instead of asking.
+   `kexec_file_load(2)` loads the three; the kernel keeps its own copy, and
+   the agent zeroes the passphrase in the memory file and in its own buffers.
+   Then it unmounts the root and locks the disk again (`lvm vgchange -a n`,
+   `cryptsetup close`): the VM's initramfs opens it afresh. Any failure up
+   to the load also locks the disk again and is refused, saying why; the VM
+   keeps waiting.
+6. Replies, exits 0, and logs `<device> unlocked; the guest's vmlinuz-<v> is
+   loaded to start` on the console:
 
    ```
    stage0-unlock 1
    unlocked /dev/vda3
    ```
 
-7. Writes `/run/stage0/unlocked` (`stage0_crypt <device>`; no secret), which
-   releases the boot. The reply is written first: teardown, which follows,
-   stops sshd.
+7. Writes `/run/stage0/unlocked` (the device; no secret), which releases
+   the boot. The reply is written first: teardown, which follows, stops sshd.
 
 A wrong passphrase is cryptsetup's failure (`No key available with this
 passphrase.`), returned as an error; nothing changes, and stage 0 keeps
@@ -533,25 +566,36 @@ begins with `stage0-unlock 1`, newline, `unlocked `. It then prints
 `vmt-unlock: VM: unlocked <device>` and exits 0. Anything else is "the VM did
 not unlock", with stage 0's error text, exit 4.
 
-## After the unlock: teardown
+## After the unlock: the kexec
 
-`local-top` sees the flag, activates LVM, and initramfs-tools mounts the root
-(`root=` from the measured command line). Then `init-bottom/stage0`, the
-last thing before `switch_root`:
+`local-top` sees the flag and stops every stage 0 process (sshd, its
+session processes, the agent, dhcpcd): it gives the unlock session up to 10
+seconds to deliver its reply, then kills, waits, kills harder; any survivor
+is a panic. Then it runs `stage0-agent --kexec`, which requires
+`/sys/kernel/kexec_loaded` to be `1` and starts the loaded kernel
+(`reboot(LINUX_REBOOT_CMD_KEXEC)`). No SSH session can pass that argument.
+If the kernel does not start, the script panics, and `panic=-1` ends the VM.
 
-- renames `stage0_crypt` to the name the guest's `/etc/crypttab` gives that
-  volume (by its LUKS UUID), so the booted system recognizes it;
-- stops every stage 0 process (sshd, its session processes, the agent,
-  dhcpcd), waiting, then killing; any survivor is a panic;
-- flushes and downs every interface stage 0 configured, and removes its
-  network state: the booted system configures its own;
-- removes its configfs-tsm entries, unmounts configfs if it mounted it, and
-  removes `/run/stage0` (host key, sshd config, unlock key copy, flags), since
-  initramfs-tools carries `/run` into the booted system. Anything left is a
-  panic.
+Nothing of stage 0 survives the kexec but what it loaded: no process, no
+mount, no network setting, no file under `/run` (the host key among them).
+initramfs-tools never mounts a root in stage 0 or reaches `init-bottom`.
 
-The booted system has its own SSH host key, on the encrypted disk, which is
-what the owner's ordinary logins check.
+The VM's own kernel and initramfs start as they would from a bootloader,
+with the command line above: the initramfs finds
+`/cryptroot/stage0.key`, opens the volume under its crypttab name, and boots
+the VM's system, which removes the initramfs and the key file with it when
+it takes over. The booted system has its own SSH host key, on the encrypted
+disk, which is what the owner's ordinary logins check.
+
+**The kexec needs DebugSwap.** In an SNP guest without it, the outgoing
+kernel's `machine_kexec()` writes DR7 after it has torn down the GHCBs, the
+write raises a #VC nothing can service, and the VM hangs; the kernel fix is
+not upstream yet. With DebugSwap (SEV feature bit 5, `0x20`) the processor
+swaps DR7 itself and the write is never intercepted. The launch sets it:
+stage 0's measurements are computed with guest features `0x21` (SNPActive
+and DebugSwap; `stage0/image.sh`, the manifest's `guest.features`), so a VM
+launched without it reports another measurement, and the owner's tool
+refuses it (check 5).
 
 ## Errors and exit status
 
@@ -594,6 +638,14 @@ The tool's exit status:
   If the host somehow got a disk that did, the booted system would lack the
   owner's own SSH host key, and the owner's next login would warn (design
   §9.1).
+- **The system that runs afterwards.** The measurement covers stage 0 only.
+  The kernel and initrd stage 0 starts come from the encrypted disk the
+  owner's passphrase just opened, which the host can damage but cannot
+  read, nor write chosen content to; stage 0 hands the passphrase to them
+  and to nothing else.
+  Whatever the owner's own system then does, including asking the processor
+  for reports (they carry the same launch measurement: a report proves how
+  the VM was launched, not what it runs now), is the owner's system's doing.
 
 What it cannot do: keep the VM running. The host can always stop it, or
 refuse to start it. And the passphrase protects the disk only as well as its

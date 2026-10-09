@@ -476,6 +476,7 @@ dependencies = [
 name = "stage0-agent"
 version = "0.6.0"
 dependencies = [
+ "libc",
  "snp",
 ]
 

@@ -61,7 +61,12 @@ KVER=7.0.0-34-generic
 # the manifest. The measurement guide passes the same values: change them
 # together.
 VCPU_TYPE=EPYC-Milan
-GUEST_FEATURES=0x1  # SEV features in each vCPU's VMSA; 0x1 is SNPActive alone
+# SEV features in each vCPU's VMSA: 0x21 is SNPActive (0x1) and DebugSwap
+# (0x20). Without DebugSwap, kexec in an SNP guest hangs (machine_kexec()'s
+# DR7 write raises a #VC nothing can service), and stage 0 starts the guest's
+# own kernel by kexec. The host's QEMU must set it too (install.sh), or the
+# guest's measurement is the 0x1 one and no owner's tool accepts it.
+GUEST_FEATURES=0x21
 VMM_TYPE=QEMU       # whose initial register state the calculator models
 OUT="" OVMF="" VCPUS=4
 while [ $# -gt 0 ]; do
@@ -190,7 +195,7 @@ mkdir -p "$C/conf.d"
 # (Phase 2: 664 in one build, 644 in another). Set them.
 find "$C" -type d -exec chmod 0755 {} +
 find "$C" -type f -exec chmod 0644 {} +
-chmod 0755 "$C"/hooks/* "$C"/scripts/*/* "$C/wait-for-root"
+chmod 0755 "$C"/hooks/* "$C"/scripts/*/*
 
 # rewrite <file> <from> <to>: literal, and the text must be there, so a
 # change in initramfs-tools stops the build instead of quietly letting the
