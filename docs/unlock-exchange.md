@@ -140,11 +140,13 @@ in this very session. Every other party sees ciphertext or nothing.
 The host prepares the VM's definition with `stage0/install.sh --build <dir>
 --domain <name> --org-ca <unlock-key.pub>`, which sets:
 
-- **Measured direct boot.** The domain boots stage 0's kernel and initrd with
-  the manifest's command line (`<kernel>`, `<initrd>`, `<cmdline>`, and
-  `kernelHashes='yes'` on `<launchSecurity type='sev-snp'>`). OVMF hashes all
-  three into its own measured pages, so the launch **measurement** (the
-  report's `MEASUREMENT`) covers firmware, kernel, initrd and command line.
+- **Measured direct boot.** The domain boots the build's own firmware
+  (`<loader>`, a copy of the snapshot's `OVMF.amdsev.fd`) and stage 0's kernel
+  and initrd with the manifest's command line (`<kernel>`, `<initrd>`,
+  `<cmdline>`, and `kernelHashes='yes'` on `<launchSecurity
+  type='sev-snp'>`). OVMF hashes the last three into its own measured pages,
+  so the launch **measurement** (the report's `MEASUREMENT`) covers firmware,
+  kernel, initrd and command line.
   The command line is `root=/dev/mapper/ubuntu--vg-ubuntu--lv ro panic=-1
   console=tty0 console=ttyS0,115200` (`stage0/cmdline`); `panic=-1` turns
   every stage 0 panic into the end of the VM. The manifest gives one

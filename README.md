@@ -111,13 +111,16 @@ every tool that assembles and compresses it, and the compiler that builds
 the agent come from that root, never from the machine running the build. It
 needs root (for mmdebstrap and the chroot) and writes a manifest that names
 this repository's commit (`source.commit`), the snapshot
-(`build.snapshot`), the kernel package and where it sits in Ubuntu's
-archive, the firmware, every package that put a file in the image, the
-build tools' versions, and the expected launch measurement per vCPU count.
-The same commit, snapshot, kernel and firmware give the same bytes on any
+(`build.snapshot`), the kernel and firmware packages and where they sit in
+Ubuntu's archive, every package that put a file in the image, the build
+tools' versions, and the expected launch measurement per vCPU count. The
+firmware is the snapshot's own `ovmf-amdsev`, and the build carries a copy
+(`OVMF.amdsev.fd`), so its firmware is always one Ubuntu's archive can
+supply. The same commit, snapshot and kernel give the same bytes on any
 machine.
-`stage0/install.sh` sets a domain's kernel, initrd, command line, `host_data`
-and the server unlock key in fw_cfg from a build. The hosting operator's
+`stage0/install.sh` sets a domain's firmware (`<loader>`), kernel, initrd,
+command line, `host_data` and the server unlock key in fw_cfg from a build,
+so a guest boots exactly what its build's measurement was computed from. The hosting operator's
 runbook (not in this repository) says when to rebuild and how to publish.
 
 ## Licence

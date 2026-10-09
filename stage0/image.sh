@@ -12,11 +12,12 @@
 # whatever the machine it runs on has installed, which is for development
 # only: the build host's packages then become inputs.
 #
-# Writes <dir>/vmlinuz, <dir>/initrd.img and <dir>/manifest. The manifest is
-# the one record of the build: the files and their digests, the command line,
-# the package versions, and the launch measurement a guest booted from it must
-# report, per vCPU count. install.sh takes the command line from it; nothing
-# else should keep a copy.
+# Writes <dir>/vmlinuz, <dir>/initrd.img, <dir>/OVMF.amdsev.fd (a copy of
+# --ovmf: the firmware is part of the build) and <dir>/manifest. The manifest
+# is the one record of the build: the files and their digests, the command
+# line, the package versions, and the launch measurement a guest booted from
+# it must report, per vCPU count. install.sh takes the command line from it;
+# nothing else should keep a copy.
 #
 # Runs unprivileged on an Ubuntu 26.04 x86_64 system with initramfs-tools-core,
 # 3cpio, busybox-initramfs, klibc-utils, kmod, dhcpcd-base, openssh-server,
@@ -143,7 +144,9 @@ kdeb_path="$(apt-get download --print-uris "linux-image-$KVER=$kpkg" | sed -n "s
 
 # The firmware: the manifest names Ubuntu's package and version for it when
 # --ovmf is byte-identical to that package's file, so a guest owner can fetch
-# it from Ubuntu's archive too.
+# it from Ubuntu's archive too. build.sh passes the root's own, so a build for
+# guests always names it; run directly, a firmware from elsewhere is measured
+# but cannot be named.
 ovmf_lines=""
 sys_fw="/usr/share/ovmf/$(basename "$OVMF")"
 if [ -f "$sys_fw" ] && cmp -s "$OVMF" "$sys_fw"; then
@@ -157,6 +160,11 @@ if [ -f "$sys_fw" ] && cmp -s "$OVMF" "$sys_fw"; then
 ovmf.deb.path $fw_path
 ovmf.deb.sha256 $(sha256sum < "${fw_deb[0]}" | cut -d' ' -f1)"
 fi
+if [ -z "$ovmf_lines" ] && [ -n "${STAGE0_SNAPSHOT:-}" ]; then
+    die "--ovmf is not this system's ovmf-amdsev file ($sys_fw): a build for guests must name its firmware's package"
+fi
+# The build carries its firmware: install.sh boots the guest from this copy.
+[ "$OVMF" -ef "$OUT/OVMF.amdsev.fd" ] || install -m 0644 "$OVMF" "$OUT/OVMF.amdsev.fd"
 deb=("$WORK"/linux-image-"$KVER"_*.deb)
 [ -f "${deb[0]}" ] || die "apt-get download produced no linux-image-$KVER package"
 dpkg-deb --fsys-tarfile "${deb[0]}" | tar -x -C "$WORK" "./boot/vmlinuz-$KVER"
@@ -233,14 +241,15 @@ M="$OUT/manifest"
     echo "initrd.sha256 $(sha "$OUT/initrd.img")"
     echo "initramfs-tools.package initramfs-tools-core $(ver initramfs-tools-core)"
     echo "cmdline $CMDLINE"
-    echo "ovmf.sha256 $(sha "$OVMF")"
+    echo "ovmf.file OVMF.amdsev.fd"
+    echo "ovmf.sha256 $(sha "$OUT/OVMF.amdsev.fd")"
     [ -z "$ovmf_lines" ] || printf '%s\n' "$ovmf_lines"
     echo "vcpu.type $VCPU_TYPE"
     echo "guest.features $GUEST_FEATURES"
     echo "vmm.type $VMM_TYPE"
     for n in ${VCPUS//,/ }; do
         m="$("$MEASURE" --mode snp --vcpus "$n" --vcpu-type "$VCPU_TYPE" \
-             --guest-features "$GUEST_FEATURES" --vmm-type "$VMM_TYPE" --ovmf "$OVMF" \
+             --guest-features "$GUEST_FEATURES" --vmm-type "$VMM_TYPE" --ovmf "$OUT/OVMF.amdsev.fd" \
              --kernel "$OUT/vmlinuz" --initrd "$OUT/initrd.img" --append "$CMDLINE")"
         [[ "$m" =~ ^[0-9a-f]{96}$ ]] || die "sev-snp-measure gave no measurement for $n vCPUs"
         echo "measurement.vcpus.$n $m"

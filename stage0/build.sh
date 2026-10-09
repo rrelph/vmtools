@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # stage0/build.sh — build stage 0 from Ubuntu's archive alone.
 #
-#   usage: sudo build.sh --ovmf <OVMF.fd> --out <dir>
+#   usage: sudo build.sh --out <dir>
 #                        [--vcpus 4[,8,...]] [--kernel <version>]
 #                        [--snapshot <YYYYMMDDTHHMMSSZ>] [--allow-changes]
 #
@@ -12,12 +12,22 @@
 # measures it, the agent's compiler included, comes from that root: nothing
 # the build host has installed reaches stage 0, so updating or rebooting the
 # host never changes what guests run, and the host need not be updated to
-# rebuild. The manifest records the snapshot; with the commit, the kernel and
-# the firmware, that is all a rebuild of the same bytes needs, on any machine
-# with mmdebstrap.
+# rebuild. The manifest records the snapshot; with the commit and the kernel,
+# that is all a rebuild of the same bytes needs, on any machine with
+# mmdebstrap.
 #
-# Writes <dir>/vmlinuz, <dir>/initrd.img and <dir>/manifest (image.sh says
-# what they hold), owned by the user who ran sudo.
+# The firmware is part of the build too: the root's own ovmf-amdsev, the
+# snapshot's newest. The build carries its file, the measurement is computed
+# with it, and install.sh boots a guest from that copy, so a guest's firmware
+# changes only when it moves to another build, together with the kernel and
+# initrd, and always to a package Ubuntu's archive can supply. (It used to be
+# a file the host pinned and passed in with --ovmf: when the archive moved
+# past the pin, the snapshot no longer had its package, and a guest owner
+# could not fetch it to reproduce the measurement.)
+#
+# Writes <dir>/vmlinuz, <dir>/initrd.img, <dir>/OVMF.amdsev.fd and
+# <dir>/manifest (image.sh says what they hold), owned by the user who ran
+# sudo.
 #
 # Needs root, for mmdebstrap's root mode and the chroot: Ubuntu restricts
 # unprivileged user namespaces by default. Needs mmdebstrap and the build
@@ -36,18 +46,18 @@ umask 022
 export LC_ALL=C
 
 KVER=7.0.0-34-generic
-OUT="" OVMF="" VCPUS=4 SNAPSHOT="" CHANGES=0
+OUT="" VCPUS=4 SNAPSHOT="" CHANGES=0
 while [ $# -gt 0 ]; do
     # Every option but --allow-changes takes a value. A pasted command that
     # wrapped between an option and its value leaves the option last, or
     # followed by another option: say so, not "unbound variable".
     case "$1" in
-        --ovmf|--out|--vcpus|--kernel|--snapshot)
+        --out|--vcpus|--kernel|--snapshot)
             [ $# -ge 2 ] && [ -n "$2" ] && [ "${2#--}" = "$2" ] \
                 || die "$1 needs a value (if you pasted this command, check it was not split across lines)" ;;
     esac
     case "$1" in
-        --ovmf)          OVMF="$(realpath "$2")"; shift 2 ;;
+        --ovmf)          die "--ovmf is gone: the build takes its firmware from the snapshot's ovmf-amdsev, and carries it" ;;
         --out)           OUT="$2"; shift 2 ;;
         --vcpus)         VCPUS="$2"; shift 2 ;;
         --kernel)        KVER="$2"; shift 2 ;;
@@ -57,8 +67,6 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ "$(id -u)" = 0 ] || die "run with sudo: it makes and enters the build root (the image itself is built inside as an unprivileged user)"
-[ -r "$OVMF" ] || die "--ovmf: not readable: $OVMF"
-[ "$(basename "$OVMF")" = OVMF.amdsev.fd ] || die "--ovmf: expected a file named OVMF.amdsev.fd, ovmf-amdsev's"
 [ -n "$OUT" ] || die "--out is required"
 [[ "$VCPUS" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || die "--vcpus: a comma-separated list of counts"
 [[ "$KVER" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-generic$ ]] || die "--kernel: a release such as 7.0.0-34-generic"
@@ -145,20 +153,10 @@ cp /etc/resolv.conf "$ROOT/etc/resolv.conf"
 mount -t proc proc "$ROOT/proc"
 mount --bind /dev "$ROOT/dev"
 
-# --- the firmware's package ---
-# image.sh names ovmf-amdsev's version in the manifest when --ovmf is that
-# package's file byte for byte. The root has the snapshot's newest; if the
-# pinned firmware is an older one the snapshot still lists, use that.
-install -m 0644 "$OVMF" "$ROOT$B/OVMF.amdsev.fd"
-if ! cmp -s "$OVMF" "$ROOT/usr/share/ovmf/OVMF.amdsev.fd"; then
-    for v in $(chroot "$ROOT" apt-cache madison ovmf-amdsev | awk '{print $3}'); do
-        chroot "$ROOT" env DEBIAN_FRONTEND=noninteractive apt-get install -y -q --allow-downgrades \
-            "ovmf-amdsev=$v" >/dev/null 2>&1 || continue
-        cmp -s "$OVMF" "$ROOT/usr/share/ovmf/OVMF.amdsev.fd" && break
-    done
-    cmp -s "$OVMF" "$ROOT/usr/share/ovmf/OVMF.amdsev.fd" \
-        || echo "build.sh: warning: --ovmf matches no ovmf-amdsev in the snapshot; the manifest will not name its package" >&2
-fi
+# --- the firmware: the snapshot's ovmf-amdsev, installed in the root ---
+# image.sh measures with it, copies it into the build and names its package.
+FW=/usr/share/ovmf/OVMF.amdsev.fd
+[ -f "$ROOT$FW" ] || die "the build root has no $FW (ovmf-amdsev)"
 
 # --- the source: this commit, and nothing else of this checkout ---
 g bundle create "$WORK/vmtools.bundle" HEAD 2>/dev/null
@@ -179,11 +177,11 @@ if [ -e "$ROOT/etc/ssl/certs/build-proxy-ca.crt" ]; then
 fi
 echo "build.sh: building the agent, the calculator and the initrd in the root" >&2
 chroot "$ROOT" "${AS_BUILDER[@]}" env -i "${ENVS[@]}" \
-    bash "$B/vmtools/stage0/image.sh" --ovmf "$B/OVMF.amdsev.fd" --out "$B/out" \
+    bash "$B/vmtools/stage0/image.sh" --ovmf "$FW" --out "$B/out" \
          --vcpus "$VCPUS" --kernel "$KVER" >/dev/null \
     || die "image.sh failed in the build root (above)"
 
-for f in vmlinuz initrd.img manifest; do
+for f in vmlinuz initrd.img OVMF.amdsev.fd manifest; do
     install -m 0644 -o "${OWNER%:*}" -g "${OWNER#*:}" "$ROOT$B/out/$f" "$OUT/$f"
 done
 cat "$OUT/manifest"

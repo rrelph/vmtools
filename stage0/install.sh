@@ -4,10 +4,14 @@
 #
 #   usage: install.sh --build <dir> --domain <name> --org-ca <ca.pub> [--pool images]
 #
-# <dir> is build.sh's output. Checks vmlinuz and initrd.img against the
-# manifest, uploads them to the pool as <name>-stage0-vmlinuz and
-# <name>-stage0-initrd, and sets the domain's <kernel>, <initrd>,
-# kernelHashes='yes' and <cmdline>. The command line comes from the manifest
+# <dir> is build.sh's output. Checks vmlinuz, initrd.img and OVMF.amdsev.fd
+# against the manifest, uploads them to the pool as <name>-stage0-vmlinuz,
+# <name>-stage0-initrd and <name>-stage0-ovmf, and sets the domain's
+# <loader> to that firmware, its <kernel>, <initrd>, kernelHashes='yes' and
+# <cmdline>. The firmware is the build's own, the one its measurements were
+# computed with: a build without one (made before builds carried their
+# firmware) is refused, since nothing here could say which firmware its
+# measurement assumes. The command line comes from the manifest
 # and nowhere else: it is a measured input that lives in the domain, not in
 # the files (Phase 1 findings). The domain's vCPU count must be one the
 # manifest has a measurement for; that measurement is printed at the end.
@@ -52,8 +56,10 @@ get() {
 }
 [ "$(get format)" = 1 ] || die "manifest: unknown format"
 CMDLINE="$(get cmdline)"
+grep -q '^ovmf\.file ' "$M" \
+    || die "$BUILD predates builds that carry their firmware (its manifest has no ovmf.file): make a new build"
 
-for part in kernel initrd; do
+for part in kernel initrd ovmf; do
     f="$BUILD/$(get "$part.file")"
     [ "$(sha256sum < "$f" | cut -d' ' -f1)" = "$(get "$part.sha256")" ] \
         || die "$f does not match the manifest"
@@ -83,11 +89,25 @@ MEASUREMENT="$(get "measurement.vcpus.$vcpus")"
 
 # --- upload ---
 declare -A path
-for part in kernel initrd; do
+for part in kernel initrd ovmf; do
     f="$BUILD/$(get "$part.file")"
-    vol="$DOMAIN-stage0-$([ "$part" = kernel ] && echo vmlinuz || echo initrd)"
+    case "$part" in kernel) vol=vmlinuz ;; *) vol="$part" ;; esac
+    vol="$DOMAIN-stage0-$vol"
     "${V[@]}" vol-delete --pool "$POOL" "$vol" >/dev/null 2>&1 || true
-    "${V[@]}" vol-create-as "$POOL" "$vol" "$(stat -c %s "$f")" --format raw >/dev/null
+    if [ "$part" = ovmf ]; then
+        # World-readable: libvirt hands the kernel and initrd to QEMU's user
+        # when the domain starts, but not the <loader>, which it expects to
+        # be readable already (as /usr/share/ovmf is). A 0600 volume left
+        # QEMU with "could not load PC BIOS" (2026-10-09). The
+        # firmware is Ubuntu's, public, and checked against the manifest.
+        volxml="$(mktemp)"
+        printf '<volume><name>%s</name><capacity unit="bytes">%s</capacity><target><format type="raw"/><permissions><mode>0644</mode></permissions></target></volume>\n' \
+            "$vol" "$(stat -c %s "$f")" > "$volxml"
+        "${V[@]}" vol-create "$POOL" "$volxml" >/dev/null
+        rm -f "$volxml"
+    else
+        "${V[@]}" vol-create-as "$POOL" "$vol" "$(stat -c %s "$f")" --format raw >/dev/null
+    fi
     "${V[@]}" vol-upload --pool "$POOL" "$vol" "$f" >/dev/null   # it prints an empty line
     path[$part]="$("${V[@]}" vol-path --pool "$POOL" "$vol")"
 done
@@ -97,13 +117,20 @@ done
 esc() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 cmd_xml="$(printf '%s' "$CMDLINE" | esc)"
 [ "$(grep -c '<loader' "$xml")" = 1 ] || die "$DOMAIN: expected exactly one <loader> line"
+[ "$(grep -c '<loader[^>]*>[^<]*</loader>' "$xml")" = 1 ] \
+    || die "$DOMAIN: expected its <loader> element on one line, with its path"
 [ "$(grep -c "<launchSecurity type='sev-snp'" "$xml")" = 1 ] \
     || die "$DOMAIN: expected exactly one sev-snp <launchSecurity> line"
-# Drop any kernel, initrd and cmdline, then put the manifest's in after the
-# loader. awk passes the values through ENVIRON, so nothing in them is code.
-# The same for any earlier hostData and fw_cfg block: put the new ones in,
-# host_data inside launchSecurity, the fw_cfg entry before <os>.
-K="${path[kernel]}" I="${path[initrd]}" C="$cmd_xml" H="$host_data_b64" F="$CA_LINE" awk '
+# Point the loader at the build's firmware, keeping its attributes. Drop any
+# kernel, initrd and cmdline, then put the manifest's in after the loader.
+# awk passes the values through ENVIRON, so nothing in them is code. The same
+# for any earlier hostData and fw_cfg block: put the new ones in, host_data
+# inside launchSecurity, the fw_cfg entry before <os>.
+L="${path[ovmf]}" K="${path[kernel]}" I="${path[initrd]}" C="$cmd_xml" H="$host_data_b64" F="$CA_LINE" awk '
+    /<loader/ {
+        i = index($0, ">"); j = index($0, "</loader>")
+        $0 = substr($0, 1, i) ENVIRON["L"] substr($0, j)
+    }
     /^[[:space:]]*<(kernel|initrd|cmdline)>.*<\/(kernel|initrd|cmdline)>[[:space:]]*$/ { next }
     /^[[:space:]]*<hostData>.*<\/hostData>[[:space:]]*$/ { next }
     /<sysinfo type=.fwcfg.>/ { skip = 1 }
@@ -134,6 +161,8 @@ grep -qF "<entry name='opt/org.vmtrust/org-ca.pub'>$CA_LINE</entry>" "$xml" \
 for part in kernel initrd; do
     grep -qF "<$part>${path[$part]}</$part>" "$xml" || die "$DOMAIN's <$part> is not ${path[$part]} after define"
 done
+[ "$(sed -n 's|.*<loader[^>]*>\([^<]*\)</loader>.*|\1|p' "$xml")" = "${path[ovmf]}" ] \
+    || die "$DOMAIN's <loader> is not ${path[ovmf]} after define"
 
 echo "$DOMAIN: stage 0 from $BUILD, $vcpus vCPUs"
 echo "host_data $host_data_hex (org CA $CA_LINE)"
